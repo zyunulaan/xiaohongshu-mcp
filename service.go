@@ -38,6 +38,7 @@ type PublishRequest struct {
 	IsOriginal bool     `json:"is_original,omitempty"` // 是否声明原创
 	Visibility string   `json:"visibility,omitempty"`  // 可见范围: "公开可见"(默认), "仅自己可见", "仅互关好友可见"
 	Products   []string `json:"products,omitempty"`    // 商品关键词列表，用于绑定带货商品
+	GroupChat  string   `json:"group_chat,omitempty"`  // 关联群聊展示名称，空则不关联
 }
 
 // LoginStatusResponse 登录状态响应
@@ -72,6 +73,7 @@ type PublishVideoRequest struct {
 	IsOriginal bool     `json:"is_original,omitempty"` // 是否声明原创
 	Visibility string   `json:"visibility,omitempty"`  // 可见范围: "公开可见"(默认), "仅自己可见", "仅互关好友可见"
 	Products   []string `json:"products,omitempty"`    // 商品关键词列表，用于绑定带货商品
+	GroupChat  string   `json:"group_chat,omitempty"`  // 关联群聊展示名称，空则不关联
 }
 
 // PublishVideoResponse 发布视频响应
@@ -248,6 +250,7 @@ func (s *XiaohongshuService) PublishContent(ctx context.Context, req *PublishReq
 		IsOriginal:   req.IsOriginal,
 		Visibility:   req.Visibility,
 		Products:     req.Products,
+		GroupChat:    req.GroupChat,
 	}
 
 	if err := s.publishContent(ctx, content); err != nil {
@@ -336,6 +339,7 @@ func (s *XiaohongshuService) PublishVideo(ctx context.Context, req *PublishVideo
 		IsOriginal:   req.IsOriginal,
 		Visibility:   req.Visibility,
 		Products:     req.Products,
+		GroupChat:    req.GroupChat,
 	}
 
 	if err := s.publishVideo(ctx, content); err != nil {

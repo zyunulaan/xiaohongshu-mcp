@@ -202,6 +202,7 @@ Content-Type: application/json
 - `is_original` (boolean, optional): 是否声明原创，`true` 为声明原创，不填则不声明
 - `visibility` (string, optional): 可见范围，支持: `公开可见`(默认)、`仅自己可见`、`仅互关好友可见`。不填则默认公开可见
 - `products` (array, optional): 商品关键词列表，用于绑定带货商品。填写商品名称或商品ID，自动搜索并选择第一个匹配结果，需账号已开通商品功能
+- `group_chat` (string, optional): 关联群聊展示名称。指定后会在发布前关联该群聊；名称无法匹配时返回错误并列出可选群聊，不会发布。不填则不关联
 
 **响应**
 ```json
@@ -246,6 +247,7 @@ Content-Type: application/json
 - `schedule_at` (string, optional): 定时发布时间，ISO8601 格式如 `2024-01-20T10:30:00+08:00`，支持1小时至14天内。不填则立即发布
 - `visibility` (string, optional): 可见范围，支持: `公开可见`(默认)、`仅自己可见`、`仅互关好友可见`。不填则默认公开可见
 - `products` (array, optional): 商品关键词列表，用于绑定带货商品。填写商品名称或商品ID，自动搜索并选择第一个匹配结果，需账号已开通商品功能
+- `group_chat` (string, optional): 关联群聊展示名称。指定后会在发布前关联该群聊；名称无法匹配时返回错误并列出可选群聊，不会发布。不填则不关联
 
 **响应**
 ```json

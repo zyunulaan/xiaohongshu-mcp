@@ -152,10 +152,11 @@ func (s *AppServer) handlePublishContent(ctx context.Context, args map[string]in
 
 	scheduleAt, _ := args["schedule_at"].(string)
 	visibility := parseVisibility(args)
+	groupChat, _ := args["group_chat"].(string)
 
 	isOriginal, _ := args["is_original"].(bool)
 
-	logrus.Infof("MCP: 发布内容 - 标题: %s, 图片数量: %d, 标签数量: %d, 定时: %s, 原创: %v, visibility: %s, 商品: %v", title, len(imagePaths), len(tags), scheduleAt, isOriginal, visibility, products)
+	logrus.Infof("MCP: 发布内容 - 标题: %s, 图片数量: %d, 标签数量: %d, 定时: %s, 原创: %v, visibility: %s, 商品: %v, 群聊: %s", title, len(imagePaths), len(tags), scheduleAt, isOriginal, visibility, products, groupChat)
 
 	req := &PublishRequest{
 		Title:      title,
@@ -166,6 +167,7 @@ func (s *AppServer) handlePublishContent(ctx context.Context, args map[string]in
 		IsOriginal: isOriginal,
 		Visibility: visibility,
 		Products:   products,
+		GroupChat:  groupChat,
 	}
 
 	result, err := s.xiaohongshuService.PublishContent(ctx, req)
@@ -225,8 +227,9 @@ func (s *AppServer) handlePublishVideo(ctx context.Context, args map[string]inte
 	scheduleAt, _ := args["schedule_at"].(string)
 	visibility := parseVisibility(args)
 	isOriginal, _ := args["is_original"].(bool)
+	groupChat, _ := args["group_chat"].(string)
 
-	logrus.Infof("MCP: 发布视频 - 标题: %s, 标签数量: %d, 定时: %s, 原创: %v, visibility: %s, 商品: %v", title, len(tags), scheduleAt, isOriginal, visibility, products)
+	logrus.Infof("MCP: 发布视频 - 标题: %s, 标签数量: %d, 定时: %s, 原创: %v, visibility: %s, 商品: %v, 群聊: %s", title, len(tags), scheduleAt, isOriginal, visibility, products, groupChat)
 
 	req := &PublishVideoRequest{
 		Title:      title,
@@ -237,6 +240,7 @@ func (s *AppServer) handlePublishVideo(ctx context.Context, args map[string]inte
 		IsOriginal: isOriginal,
 		Visibility: visibility,
 		Products:   products,
+		GroupChat:  groupChat,
 	}
 
 	result, err := s.xiaohongshuService.PublishVideo(ctx, req)
