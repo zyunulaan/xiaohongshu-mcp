@@ -861,12 +861,14 @@ After successful connection, you can use the following MCP tools:
   - `is_original`: Declare as original content (optional), default is not declared
   - `visibility`: Visibility scope (optional), supports `公开可见` / public (default), `仅自己可见` / self-only, `仅互关好友可见` / mutual-followers-only
   - `products`: Product keyword list (optional), used to attach products for social commerce. Provide a product name or product ID; the system searches automatically and picks the first match. Requires the product feature to be enabled on your account. Example: [面膜, 防晒霜SPF50]
+  - `group_chat`: Link a group chat (optional). Pass the group display name as shown in Creator Platform under 「选择群聊」. If the name cannot be matched, the tool returns an error listing available groups and does not publish. Omit to skip linking.
 - `publish_with_video` - Publish video content to RedNote (required: title, content, video)
   - `video`: Local video file absolute path (single file only)
   - `tags`: Topic tags list (optional), e.g. `["food", "travel", "lifestyle"]`
   - `schedule_at`: Scheduled publish time (optional), ISO8601 format, supports 1 hour to 14 days ahead
   - `visibility`: Visibility scope (optional), supports `公开可见` / public (default), `仅自己可见` / self-only, `仅互关好友可见` / mutual-followers-only
   - `products`: Product keyword list (optional), used to attach products for social commerce. Provide a product name or product ID; the system searches automatically and picks the first match. Requires the product feature to be enabled on your account. Example: [面膜, 防晒霜SPF50]
+  - `group_chat`: Link a group chat (optional). Same behavior as `publish_content`.
 - `list_feeds` - Get RedNote homepage recommendation list (no parameters)
 - `search_feeds` - Search RedNote content (required: keyword)
   - `filters`: Filter options (optional). Values must be passed exactly as the Chinese strings below — they match the labels on the RedNote filter panel.

@@ -33,6 +33,7 @@ func TestPublishContentImagesSchema(t *testing.T) {
 		}
 	}
 	require.Contains(t, schema.Properties, "images")
+	require.Contains(t, schema.Properties, "group_chat")
 	resolved, err := schema.Resolve(nil)
 	require.NoError(t, err)
 	for _, test := range []struct {

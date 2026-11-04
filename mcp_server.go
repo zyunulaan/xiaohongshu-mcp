@@ -26,6 +26,7 @@ type PublishContentArgs struct {
 	IsOriginal bool     `json:"is_original,omitempty" jsonschema:"是否声明原创（可选），true为声明原创，false或不填则不声明"`
 	Visibility string   `json:"visibility,omitempty" jsonschema:"可见范围（可选），支持: 公开可见(默认)、仅自己可见、仅互关好友可见。不填则默认公开可见"`
 	Products   []string `json:"products,omitempty" jsonschema:"商品关键词列表（可选），用于绑定带货商品。填写商品名称或商品ID，系统会自动搜索并选择第一个匹配结果。需账号已开通商品功能。示例: [面膜, 防晒霜SPF50]"`
+	GroupChat  string   `json:"group_chat,omitempty" jsonschema:"关联群聊（可选），填写群聊展示名称（与创作服务平台「选择群聊」列表中的名称一致）。指定后发布前会关联该群聊；名称无法匹配时将报错并列出可选群聊，不会发布。不填则不关联"`
 }
 
 // PublishVideoArgs 发布视频的参数（仅支持本地单个视频文件）
@@ -38,6 +39,7 @@ type PublishVideoArgs struct {
 	IsOriginal bool     `json:"is_original,omitempty" jsonschema:"是否声明原创（可选），true为声明原创，false或不填则不声明"`
 	Visibility string   `json:"visibility,omitempty" jsonschema:"可见范围（可选），支持: 公开可见(默认)、仅自己可见、仅互关好友可见。不填则默认公开可见"`
 	Products   []string `json:"products,omitempty" jsonschema:"商品关键词列表（可选），用于绑定带货商品。填写商品名称或商品ID，系统会自动搜索并选择第一个匹配结果。需账号已开通商品功能。示例: [面膜, 防晒霜SPF50]"`
+	GroupChat  string   `json:"group_chat,omitempty" jsonschema:"关联群聊（可选），填写群聊展示名称（与创作服务平台「选择群聊」列表中的名称一致）。指定后发布前会关联该群聊；名称无法匹配时将报错并列出可选群聊，不会发布。不填则不关联"`
 }
 
 // SearchFeedsArgs 搜索内容的参数
@@ -257,6 +259,7 @@ func registerTools(server *mcp.Server, appServer *AppServer) {
 				"is_original": args.IsOriginal,
 				"visibility":  args.Visibility,
 				"products":    convertStringsToInterfaces(args.Products),
+				"group_chat":  args.GroupChat,
 			}
 			result := appServer.handlePublishContent(ctx, argsMap)
 			return convertToMCPResult(result), nil, nil
@@ -432,6 +435,7 @@ func registerTools(server *mcp.Server, appServer *AppServer) {
 				"is_original": args.IsOriginal,
 				"visibility":  args.Visibility,
 				"products":    convertStringsToInterfaces(args.Products),
+				"group_chat":  args.GroupChat,
 			}
 			result := appServer.handlePublishVideo(ctx, argsMap)
 			return convertToMCPResult(result), nil, nil
