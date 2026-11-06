@@ -36,6 +36,18 @@ func (a *LoginAction) CheckLoginStatus(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
+// CheckLoggedInOnExploreLayout 与 CheckLoginStatus 使用同一侧栏选择器判定是否已登录，
+// 但不执行导航（调用方须已通过 softOpenExplore 等落在含侧栏的页面）。
+func (a *LoginAction) CheckLoggedInOnExploreLayout(ctx context.Context) (bool, error) {
+	pp := a.page.Context(ctx).Timeout(15 * time.Second)
+	time.Sleep(500 * time.Millisecond)
+	exists, _, err := pp.Has(`.main-container .user .link-wrapper .channel`)
+	if err != nil {
+		return false, errors.Wrap(err, "check login status failed")
+	}
+	return exists, nil
+}
+
 // CurrentUser 当前登录用户的基础信息。
 type CurrentUser struct {
 	Nickname string `json:"nickname"`

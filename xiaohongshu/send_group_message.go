@@ -2,6 +2,7 @@ package xiaohongshu
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,13 +16,16 @@ import (
 )
 
 const (
-	// groupIMEntryURL 网页私信入口（群聊与单聊均在此路由下，依赖账号与产品灰度）。
 	groupIMEntryURL = "https://www.xiaohongshu.com/im"
 
-	groupMessageOverallTimeout = 90 * time.Second
-	imUILoadMaxWait            = 40 * time.Second // 非 IM 界面尽快失败（~40s）
-	afterNavigatePause         = 1200 * time.Millisecond
+	groupMessageOverallTimeout = 120 * time.Second
+	imUILoadMaxWait            = 40 * time.Second
 	sendVerifyTimeout          = 25 * time.Second
+
+	navAttemptTimeout = 15 * time.Second // 单次导航超时
+	waitLoadShort     = 8 * time.Second
+	waitStableShort   = 2 * time.Second
+	exploreNavTimeout = 22 * time.Second
 )
 
 // GroupMessageInput 发送群聊消息的参数（网页私信）。
@@ -40,7 +44,6 @@ type GroupMessageResult struct {
 }
 
 // ValidateGroupMessageInput 校验参数并在启动浏览器前检查本地图片路径。
-// dry_run 时允许仅有群名；非 dry_run 时 text 与 images 至少一项非空。
 func ValidateGroupMessageInput(in GroupMessageInput) error {
 	in.GroupChat = strings.TrimSpace(in.GroupChat)
 	if in.GroupChat == "" {
@@ -75,22 +78,41 @@ func ValidateGroupMessageInput(in GroupMessageInput) error {
 }
 
 // SendGroupMessage 打开私信页、按展示名精确匹配群聊并发送；dry_run 只打开并校验找到群聊。
-// debugArtifactsDir 非空时，失败会在该目录写入截图/HTML/URL 供排查。
-func SendGroupMessage(ctx context.Context, page *rod.Page, in GroupMessageInput, debugArtifactsDir string) (*GroupMessageResult, error) {
-	if err := ValidateGroupMessageInput(in); err != nil {
-		return nil, err
+func SendGroupMessage(ctx context.Context, page *rod.Page, in GroupMessageInput, debugArtifactsDir string) (res *GroupMessageResult, err error) {
+	var exploreSnap sendGroupDebugPaths
+	defer func() {
+		if r := recover(); r != nil {
+			err = errors.Errorf("send_group_message panic: %v", r)
+			if debugArtifactsDir != "" && page != nil {
+				paths, se := saveSendGroupMessageDebug(page, debugArtifactsDir)
+				if se != nil {
+					err = errors.Wrap(se, err.Error())
+				} else {
+					err = errors.Errorf("%v; panic 后页面调试: screenshot=%s html=%s url_file=%s", err, paths.png, paths.html, paths.urlFile)
+				}
+			}
+			if exploreSnap.png != "" || exploreSnap.html != "" {
+				err = errors.Errorf("%v; explore 快照: png=%s html=%s url_file=%s", err, exploreSnap.png, exploreSnap.html, exploreSnap.urlFile)
+			}
+			res = nil
+		}
+	}()
+
+	if e := ValidateGroupMessageInput(in); e != nil {
+		return nil, e
 	}
 
 	pp := page.Context(ctx).Timeout(groupMessageOverallTimeout)
 
-	if err := openGroupIMPage(ctx, pp); err != nil {
-		return nil, wrapWithSendGroupDebug(pp, debugArtifactsDir, err)
+	err = openGroupIMPage(ctx, pp, debugArtifactsDir, &exploreSnap)
+	if err != nil {
+		return nil, wrapWithSendGroupDebugExtra(pp, debugArtifactsDir, err, formatExplorePrefix(exploreSnap))
 	}
 	if err := waitConversationSidebar(pp); err != nil {
-		return nil, wrapWithSendGroupDebug(pp, debugArtifactsDir, err)
+		return nil, wrapWithSendGroupDebugExtra(pp, debugArtifactsDir, err, formatExplorePrefix(exploreSnap))
 	}
 	if err := openGroupConversation(pp, in.GroupChat); err != nil {
-		return nil, wrapWithSendGroupDebug(pp, debugArtifactsDir, err)
+		return nil, wrapWithSendGroupDebugExtra(pp, debugArtifactsDir, err, formatExplorePrefix(exploreSnap))
 	}
 	if in.DryRun {
 		return &GroupMessageResult{
@@ -103,12 +125,12 @@ func SendGroupMessage(ctx context.Context, page *rod.Page, in GroupMessageInput,
 	for _, path := range in.ImagePaths {
 		path = strings.TrimSpace(path)
 		if err := sendOneImageMessage(pp, path); err != nil {
-			return nil, wrapWithSendGroupDebug(pp, debugArtifactsDir, err)
+			return nil, wrapWithSendGroupDebugExtra(pp, debugArtifactsDir, err, formatExplorePrefix(exploreSnap))
 		}
 	}
 	if txt := strings.TrimSpace(in.Text); txt != "" {
 		if err := sendTextMessage(pp, txt); err != nil {
-			return nil, wrapWithSendGroupDebug(pp, debugArtifactsDir, err)
+			return nil, wrapWithSendGroupDebugExtra(pp, debugArtifactsDir, err, formatExplorePrefix(exploreSnap))
 		}
 	}
 
@@ -119,17 +141,64 @@ func SendGroupMessage(ctx context.Context, page *rod.Page, in GroupMessageInput,
 	}, nil
 }
 
-// openGroupIMPage 与 check_login_status 一致：先落地 explore 注入登录态，再用 LoginAction 检测；再尝试点「消息/私信」或直达 /im。
-func openGroupIMPage(ctx context.Context, page *rod.Page) error {
-	pp := page.Context(ctx).Timeout(60 * time.Second)
+func formatExplorePrefix(p sendGroupDebugPaths) string {
+	if strings.TrimSpace(p.png) == "" && strings.TrimSpace(p.html) == "" {
+		return ""
+	}
+	return fmt.Sprintf("explore 快照: png=%s html=%s url_file=%s", p.png, p.html, p.urlFile)
+}
 
-	if err := NewNavigate(pp).ToExplorePage(ctx); err != nil {
+func softWaitLoad(page *rod.Page, d time.Duration) error {
+	if page == nil {
+		return nil
+	}
+	return page.Timeout(d).WaitLoad()
+}
+
+func softWaitStable(page *rod.Page, d time.Duration) error {
+	if page == nil {
+		return nil
+	}
+	return page.WaitStable(d)
+}
+
+func softNavigate(ctx context.Context, page *rod.Page, rawURL string) error {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return errors.New("empty URL")
+	}
+	navCtx, cancel := context.WithTimeout(ctx, navAttemptTimeout)
+	defer cancel()
+	p := page.Context(navCtx)
+	return p.Navigate(rawURL)
+}
+
+// softOpenExplore 与 check_login_status 同址，但不使用 Must*，避免超时时 panic。
+func softOpenExplore(ctx context.Context, page *rod.Page) error {
+	navCtx, cancel := context.WithTimeout(ctx, exploreNavTimeout)
+	defer cancel()
+	p := page.Context(navCtx)
+	if err := p.Navigate("https://www.xiaohongshu.com/explore"); err != nil {
+		return errors.Wrap(err, "导航 explore")
+	}
+	if err := softWaitLoad(p, 12*time.Second); err != nil {
+		logrus.Debugf("explore WaitLoad: %v", err)
+	}
+	if _, err := p.Timeout(8 * time.Second).Element(`div#app`); err != nil {
+		logrus.Debugf("explore 未找到 div#app: %v", err)
+	}
+	return softWaitStable(p, waitStableShort)
+}
+
+// openGroupIMPage 先 soft explore + 侧栏登录检测，再保存 explore 快照（写入 *exploreSnapOut），依次尝试点击入口与多 URL。
+func openGroupIMPage(ctx context.Context, page *rod.Page, debugDir string, exploreSnapOut *sendGroupDebugPaths) error {
+	if err := softOpenExplore(ctx, page); err != nil {
 		return errors.Wrap(err, "打开 explore 失败")
 	}
-	time.Sleep(1000 * time.Millisecond)
+	time.Sleep(600 * time.Millisecond)
 
-	loginAction := NewLogin(pp)
-	isLoggedIn, err := loginAction.CheckLoginStatus(ctx)
+	loginAction := NewLogin(page)
+	isLoggedIn, err := loginAction.CheckLoggedInOnExploreLayout(ctx)
 	if err != nil {
 		return errors.Wrap(err, "检测登录态失败")
 	}
@@ -137,22 +206,126 @@ func openGroupIMPage(ctx context.Context, page *rod.Page) error {
 		return errors.New("未登录：请先使用扫码登录后再发送群消息")
 	}
 
-	// 尝试从侧栏进私信（单页应用内导航，cookie 与首页一致）
-	if err := tryClickMessageEntry(pp, ctx); err != nil {
-		logrus.Debugf("侧栏未点到消息入口，改直达 /im: %v", err)
-	}
-	if pageLooksLikeIM(pp) {
-		pp.MustWaitStable()
-		return nil
+	if debugDir != "" && exploreSnapOut != nil {
+		snap, errS := saveSendGroupExploreSnapshot(page, debugDir)
+		*exploreSnapOut = snap
+		if errS != nil {
+			logrus.Warnf("explore 快照未完整保存: %v", errS)
+		}
 	}
 
-	pp.Timeout(45 * time.Second).MustNavigate(groupIMEntryURL).MustWaitLoad()
-	time.Sleep(afterNavigatePause)
-	pp.MustWaitStable()
-	return nil
+	var tried []string
+	logTry := func(label, u string, navErr error) {
+		tried = append(tried, fmt.Sprintf("%s %s -> %v", label, u, errStr(navErr)))
+		logrus.Infof("send_group_message: try [%s] %s err=%v", label, u, navErr)
+	}
+
+	// 1) 侧栏「消息」「私信」点击
+	if err := tryClickMessageEntry(page, ctx); err == nil {
+		_ = softWaitStable(page, waitStableShort)
+		time.Sleep(500 * time.Millisecond)
+		if pageLooksLikeIM(page) {
+			_ = softWaitStable(page, 1500*time.Millisecond)
+			return nil
+		}
+		logTry("click_sidebar_message", "(in-page)", nil)
+	} else {
+		logrus.Debugf("未点到侧栏消息入口: %v", err)
+	}
+
+	// 2) 从 explore DOM 收集含 消息/私信/im 等关键词的站内链接
+	pageLinks, _ := collectExploreMessageLinks(page)
+
+	candidates := uniqueStringsOrdered(append(pageLinks,
+		"https://www.xiaohongshu.com/notification",
+		groupIMEntryURL,
+	))
+
+	for _, u := range candidates {
+		navErr := softNavigate(ctx, page, u)
+		logTry("navigate", u, navErr)
+		_ = softWaitLoad(page, waitLoadShort)
+		_ = softWaitStable(page, waitStableShort)
+		time.Sleep(400 * time.Millisecond)
+		if pageLooksLikeIM(page) {
+			return nil
+		}
+		// 导航超时仍继续读当前 document
+		if detectLoginWall(page) {
+			return errors.Errorf("已进入登录墙页面（已尝试: %s）", summarizeTried(tried))
+		}
+	}
+
+	return errors.Errorf("未能进入网页私信/IM（已尝试: %s）", summarizeTried(tried))
 }
 
-// tryClickMessageEntry 点击侧栏或顶栏文案为「消息」「私信」的入口。
+func errStr(e error) string {
+	if e == nil {
+		return "ok"
+	}
+	return e.Error()
+}
+
+func summarizeTried(tried []string) string {
+	if len(tried) == 0 {
+		return "(none)"
+	}
+	return strings.Join(tried, " | ")
+}
+
+func uniqueStringsOrdered(in []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, s := range in {
+		s = strings.TrimSpace(s)
+		if s == "" || seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
+}
+
+// collectExploreMessageLinks 从当前页收集可能是消息/私信/群聊/通知 的站内链接。
+func collectExploreMessageLinks(page *rod.Page) ([]string, error) {
+	res, err := page.Eval(`() => {
+		const out = [];
+		const seen = new Set();
+		const keys = ['消息', '私信', '群聊', '通知', 'notification', 'chat', 'message', '/im', 'inbox'];
+		for (const a of document.querySelectorAll('a[href]')) {
+			const href = (a.getAttribute('href') || '').trim();
+			if (!href || href === '#' || href.startsWith('javascript:')) continue;
+			const text = (a.innerText || a.textContent || '').trim();
+			let abs;
+			try { abs = new URL(href, location.origin).href; } catch (e) { continue; }
+			if (!abs.includes('xiaohongshu.com')) continue;
+			const hay = (text + ' ' + href).toLowerCase();
+			let hit = false;
+			for (const k of keys) {
+				if (hay.includes(String(k).toLowerCase())) { hit = true; break; }
+			}
+			if (!hit) continue;
+			if (seen.has(abs)) continue;
+			seen.add(abs);
+			out.push(abs);
+		}
+		return JSON.stringify(out);
+	}`)
+	if err != nil {
+		return nil, err
+	}
+	raw := res.Value.String()
+	var list []string
+	if raw == "" {
+		return nil, nil
+	}
+	if uerr := json.Unmarshal([]byte(raw), &list); uerr != nil {
+		return nil, uerr
+	}
+	return list, nil
+}
+
 func tryClickMessageEntry(page *rod.Page, ctx context.Context) error {
 	res, err := page.Eval(`() => {
 		const labels = ['消息', '私信'];
@@ -183,7 +356,6 @@ func tryClickMessageEntry(page *rod.Page, ctx context.Context) error {
 	return nil
 }
 
-// pageLooksLikeIM 当前是否已处于私信/IM 壳（URL 或会话列表区域）。
 func pageLooksLikeIM(page *rod.Page) bool {
 	res, err := page.Eval(`() => {
 		const href = location.href || '';
@@ -219,7 +391,6 @@ func pageLooksLikeIM(page *rod.Page) bool {
 	}
 }
 
-// detectLoginWall explore / im 上若出现扫码登录容器，视为未带入会话。
 func detectLoginWall(page *rod.Page) bool {
 	res, err := page.Eval(`() => !!document.querySelector('.login-container .qrcode-img') || !!document.querySelector('.login-container')`)
 	if err != nil {
@@ -239,7 +410,6 @@ func detectUnsupportedIM(page *rod.Page) bool {
 	return err == nil && res.Value.Bool()
 }
 
-// waitConversationSidebar 等待 IM UI；40s 内既不是 IM 又不像登录墙则失败。
 func waitConversationSidebar(page *rod.Page) error {
 	deadline := time.Now().Add(imUILoadMaxWait)
 	for time.Now().Before(deadline) {
@@ -302,7 +472,7 @@ func clickConversationByExactTitle(page *rod.Page, title string) error {
 		}
 	}
 	humanize.Delay(page.GetContext(), humanize.AfterClick)
-	page.MustWaitStable()
+	_ = softWaitStable(page, waitStableShort)
 	return nil
 }
 
@@ -401,7 +571,7 @@ func clickSendIfNeededAfterUpload(page *rod.Page) error {
 		return errors.Wrap(err, "点击发送图片失败")
 	}
 	humanize.Delay(page.GetContext(), humanize.AfterClick)
-	page.MustWaitStable()
+	_ = softWaitStable(page, waitStableShort)
 	return nil
 }
 
@@ -422,7 +592,7 @@ func sendTextMessage(page *rod.Page, text string) error {
 		return errors.Wrap(err, "点击发送文字失败")
 	}
 	humanize.Delay(page.GetContext(), humanize.AfterClick)
-	page.MustWaitStable()
+	_ = softWaitStable(page, waitStableShort)
 	if err := waitMessageAppears(page, text); err != nil {
 		return errors.Wrap(err, "发送文字后未在会话中确认到消息")
 	}

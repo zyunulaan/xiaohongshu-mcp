@@ -72,9 +72,12 @@ Token 缺失或无效时，接口返回 HTTP `401 Unauthorized`。命令行参�
 
 ### 群聊消息（网页私信）
 
-通过已保存的 cookies **先打开** `https://www.xiaohongshu.com/explore`（与 `check_login_status` 相同注入登录态），用同一套 **`LoginAction.CheckLoginStatus`** 判断是否已登录；随后尝试点击侧栏「消息」「私信」进入 IM，若未进入再直达 `https://www.xiaohongshu.com/im`。在会话列表中按**展示名精确匹配**（与创作服务平台「选择群聊」一致，大小写不敏感）定位群聊，再发送内容。若约 **40 秒**内仍未出现网页私信/IM 布局，会失败返回。部分账号或地区可能无法在网页端使用私信；此时接口会返回明确错误且不会发送。
+通过已保存的 cookies **先打开** `https://www.xiaohongshu.com/explore`（短超时、`Navigate`/`WaitLoad`/`WaitStable` 均非 `Must*`，导航超时也继续读当前文档），用侧栏 **`CheckLoggedInOnExploreLayout`**（与 `check_login_status` 同一选择器，但不重复导航）判断是否已登录。随后 **保存 explore 快照**（文件名带 `_explore` 后缀），再依次尝试：点击侧栏「消息」「私信」、从 explore 页面 HTML 解析出的站内「消息/私信/通知/im」等链接、`https://www.xiaohongshu.com/notification`、`https://www.xiaohongshu.com/im`，每次单独约 **15s** 导航超时，并写入服务日志。若检测到 IM 壳则继续。在会话列表中按**展示名精确匹配**定位群聊。**40 秒**内若仍无 IM 布局则失败。部分账号或地区无法使用网页私信时会返回明确错误。
 
-**失败调试**：任意步骤失败时，会在 **cookies 文件所在目录**（与 `COOKIES_PATH` / 默认 `cookies.json` 同目录）写入三份文件：`send_group_message_debug_<毫秒时间戳>.png`（整页截图）、同 stem 的 `.html`（页面 HTML）、以及 `*_url.txt`（最终页面 URL）。错误信息中会附带这些路径。
+**失败调试**：任意步骤失败（含 **panic**）时，会在 **cookies 文件所在目录** 写入：
+- **失败瞬间页面**：`send_group_message_debug_<ms>.png/.html/*_url.txt`  
+- **进入 IM 前的 explore 页**（只要已生成）：`send_group_message_debug_<ms>_explore.png`、`.html`、`*_explore_url.txt`  
+错误信息中会附带路径，并包含已尝试的候选 URL 摘要。
 
 **请求**
 
