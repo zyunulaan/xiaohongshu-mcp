@@ -110,6 +110,7 @@ func TestNotificationRoutesRegistered(t *testing.T) {
 		"POST /api/v1/notifications/list",
 		"POST /api/v1/notifications/reply",
 		"POST /api/v1/notifications/like",
+		"POST /api/v1/send_group_message",
 	} {
 		assert.True(t, registered[want], "路由 %s 应已注册", want)
 	}

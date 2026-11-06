@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/go-rod/rod"
@@ -358,6 +359,35 @@ func (s *XiaohongshuService) PublishVideo(ctx context.Context, req *PublishVideo
 		Status:  "发布完成",
 	}
 	return resp, nil
+}
+
+// SendGroupMessage 在网页私信中向展示名完全匹配的群聊发消息；dry_run 仅打开并校验找到群聊。
+func (s *XiaohongshuService) SendGroupMessage(ctx context.Context, req *SendGroupMessageRequest) (*SendGroupMessageResponse, error) {
+	in := xiaohongshu.GroupMessageInput{
+		GroupChat:  req.GroupChat,
+		Text:       req.Text,
+		ImagePaths: req.Images,
+		DryRun:     req.DryRun,
+	}
+	b := newBrowser()
+	defer b.Close()
+
+	page := b.NewPage()
+	defer page.Close()
+
+	debugDir := filepath.Dir(cookies.GetCookiesFilePath())
+	result, err := xiaohongshu.SendGroupMessage(ctx, page, in, debugDir)
+	if err != nil {
+		return nil, err
+	}
+	return &SendGroupMessageResponse{
+		GroupChat:            result.GroupChat,
+		DryRun:               result.DryRun,
+		Status:               result.Status,
+		ChatSnapshot:         result.ChatSnapshot,
+		ConversationSnapshot: result.ConversationSnapshot,
+		DryRunDiagnostics:    result.DryRunDiagnostics,
+	}, nil
 }
 
 // publishVideo 执行视频发布

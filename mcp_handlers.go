@@ -842,3 +842,71 @@ func (s *AppServer) handleLikeNotification(ctx context.Context, commentID string
 
 	return marshalMCPResult(result, "点赞")
 }
+
+// handleSendGroupMessage 网页私信向群聊发送消息
+func (s *AppServer) handleSendGroupMessage(ctx context.Context, args map[string]interface{}) *MCPToolResult {
+	logrus.Info("MCP: send_group_message")
+
+	groupChat, _ := args["group_chat"].(string)
+	text, _ := args["text"].(string)
+	dryRun := false
+	if raw, ok := args["dry_run"]; ok {
+		switch v := raw.(type) {
+		case bool:
+			dryRun = v
+		case string:
+			if parsed, err := strconv.ParseBool(v); err == nil {
+				dryRun = parsed
+			}
+		case float64:
+			dryRun = v != 0
+		}
+	}
+
+	var imagePaths []string
+	if raw, ok := args["images"].([]interface{}); ok && raw != nil {
+		for _, path := range raw {
+			if pathStr, ok := path.(string); ok {
+				imagePaths = append(imagePaths, pathStr)
+			}
+		}
+	}
+
+	req := &SendGroupMessageRequest{
+		GroupChat: groupChat,
+		Text:      text,
+		Images:    imagePaths,
+		DryRun:    dryRun,
+	}
+
+	in := xiaohongshu.GroupMessageInput{
+		GroupChat:  groupChat,
+		Text:       text,
+		ImagePaths: imagePaths,
+		DryRun:     dryRun,
+	}
+	if err := xiaohongshu.ValidateGroupMessageInput(in); err != nil {
+		return &MCPToolResult{
+			Content: []MCPContent{{Type: "text", Text: "参数校验失败: " + err.Error()}},
+			IsError: true,
+		}
+	}
+
+	result, err := s.xiaohongshuService.SendGroupMessage(ctx, req)
+	if err != nil {
+		return &MCPToolResult{
+			Content: []MCPContent{{Type: "text", Text: "发送失败: " + err.Error()}},
+			IsError: true,
+		}
+	}
+
+	jsonData, err := json.MarshalIndent(result, "", "  ")
+	if err != nil {
+		return &MCPToolResult{
+			Content: []MCPContent{{Type: "text", Text: fmt.Sprintf("成功但序列化失败: %v", err)}},
+			IsError: true,
+		}
+	}
+
+	return &MCPToolResult{Content: []MCPContent{{Type: "text", Text: string(jsonData)}}}
+}

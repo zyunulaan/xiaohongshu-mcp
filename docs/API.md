@@ -64,10 +64,65 @@ Token 缺失或无效时，接口返回 HTTP `401 Unauthorized`。命令行参�
 | POST | `/api/v1/feeds/comment/reply` | 回复评论 |
 | POST | `/api/v1/feeds/like` | 点赞/取消点赞 |
 | POST | `/api/v1/feeds/favorite` | 收藏/取消收藏 |
+| POST | `/api/v1/send_group_message` | 网页私信向群聊发消息（文字与/或本地图片） |
 
 ---
 
 ## API 端点
+
+### 群聊消息（网页私信 /chat）
+
+通过已保存的 cookies **先打开** `https://www.xiaohongshu.com/explore`（导航均带独立短超时、无 `Must*`），用侧栏 **`CheckLoggedInOnExploreLayout`**（与 `check_login_status` 同一 `.main-container .user ... .channel` 选择器）判断是否已登录。随后保存 **explore 快照**（`*_explore.*`），再 **优先点击侧栏「消息」**（如 `#im_chat_tab` / `span.channel`），若 URL 仍未进入 `/chat`，则导航到  
+`https://www.xiaohongshu.com/chat?channel_id=&channel_type=explore_feed`。进入后保存 **chat 快照**（`*_chat.*`，**含 dry_run 成功**），再 **最多约 25 秒** 等待左侧会话列表出现。左侧栏内 **滚动** 查找展示名与 `group_chat` **去空白后大小写不敏感**相等的可见文本，点击后检测右侧是否有 **textarea / contenteditable** 输入框。
+
+**调试文件**（与 `cookies.json` 同目录）：
+- `send_group_message_debug_<ms>_explore.png/.html/*_explore_url.txt`
+- `send_group_message_debug_<ms>_chat.png/.html/*_chat_url.txt`（进入 /chat 后即写入）
+- `send_group_message_debug_<ms>_conv.png/.html/*_conv_url.txt`（点击左侧群聊打开右侧面板后写入，便于查看 composer DOM）
+- 图片发送重试时可能另存 `*_conv_img_<tag>_fail` / `*_conv_img_<tag>_noverify`（每次 paste/drop 尝试失败或未确认时）
+- 失败或 panic 时另有无前缀 `_explore`/`_chat`/`_conv` 后缀的 `send_group_message_debug_<ms>.*` 当前页快照（调试保存使用独立短超时）
+
+**dry_run 成功** 时 `data` 含 `chat_snapshot`、`conversation_snapshot`（`*_conv`）与 `dry_run_diagnostics`（匹配到的文本、粗略 selector、`input_visible`、`scroll_attempts`、`chat_url`）。
+
+**请求**
+
+```
+POST /api/v1/send_group_message
+Content-Type: application/json
+```
+
+```json
+{
+  "group_chat": "我的交流群",
+  "text": "大家好",
+  "images": ["/path/to/photo.png"],
+  "dry_run": false
+}
+```
+
+- `group_chat` (string, **必填**)：群聊展示名称。
+- `text` (string, 可选)：文字内容。
+- `images` (string[], 可选)：本地 **jpg/png** 绝对路径列表。**非 dry_run** 时 `text` 与 `images` 至少提供一项；服务端会在启动浏览器前检查路径存在。
+- `dry_run` (bool, 可选)：`true` 时仅打开私信页并定位群聊，不发送。
+
+**成功响应**
+
+```json
+{
+  "success": true,
+  "data": {
+    "group_chat": "我的交流群",
+    "dry_run": false,
+    "status": "消息已发送并校验出现在会话中"
+  },
+  "message": "群消息已发送"
+}
+```
+
+**说明**
+
+- 图片：网页端可能无文件选择器；服务端将本地文件读入后，在 **`contenteditable` 输入框**（如 `.xhs-im-input-bar-editor`）上依次尝试 **Clipboard `paste`**（File + DataTransfer）、**`drop`**（含 dragenter/dragover）到输入框、再 **`drop` 到 `.xhs-im-view`/消息区**；若有「发送/确定/确认」则点击，否则回车。成功后通过右侧消息区（优先疑似己方气泡）内 **新增 `<img>`** 确认。
+- 若找不到群聊、网页提示不支持私信、展示登录墙、**约 25s** 内无会话列表布局、或（非 dry_run）无法命中输入框，返回错误且不会发送（并见上方调试文件）。文本发送若找不到「发送」按钮会尝试 **回车**；发送后在**右侧消息区**轮询确认内容出现（不仅依赖 `document.body`）。
 
 ### 1. 健康检查
 
