@@ -411,3 +411,37 @@ func (s *AppServer) likeNotificationHandler(c *gin.Context) {
 
 	respondSuccess(c, map[string]any{"data": result}, "操作成功")
 }
+
+// sendGroupMessageHandler POST /api/v1/send_group_message — 网页私信向群聊发消息
+func (s *AppServer) sendGroupMessageHandler(c *gin.Context) {
+	var req SendGroupMessageRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		respondError(c, http.StatusBadRequest, "INVALID_REQUEST",
+			"请求参数错误", err.Error())
+		return
+	}
+
+	in := xiaohongshu.GroupMessageInput{
+		GroupChat:  req.GroupChat,
+		Text:       req.Text,
+		ImagePaths: req.Images,
+		DryRun:     req.DryRun,
+	}
+	if err := xiaohongshu.ValidateGroupMessageInput(in); err != nil {
+		respondError(c, http.StatusBadRequest, "INVALID_REQUEST", "参数校验失败", err.Error())
+		return
+	}
+
+	result, err := s.xiaohongshuService.SendGroupMessage(c.Request.Context(), &req)
+	if err != nil {
+		respondError(c, http.StatusInternalServerError, "SEND_GROUP_MESSAGE_FAILED",
+			"发送群消息失败", err.Error())
+		return
+	}
+
+	msg := "群消息已发送"
+	if result.DryRun {
+		msg = "dry_run：已定位群聊，未发送"
+	}
+	respondSuccess(c, result, msg)
+}

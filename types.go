@@ -142,3 +142,18 @@ type LikeNotificationRequest struct {
 	CommentID string `json:"comment_id" binding:"required"`
 	Unlike    bool   `json:"unlike,omitempty"`
 }
+
+// SendGroupMessageRequest 网页私信群聊发送（请求体与 service 层一致，便于绑定与文档）
+type SendGroupMessageRequest struct {
+	GroupChat string   `json:"group_chat" binding:"required"`
+	Text      string   `json:"text,omitempty"`
+	Images    []string `json:"images,omitempty"`
+	DryRun    bool     `json:"dry_run,omitempty"`
+}
+
+// SendGroupMessageResponse 群聊发送结果
+type SendGroupMessageResponse struct {
+	GroupChat string `json:"group_chat"`
+	DryRun    bool   `json:"dry_run"`
+	Status    string `json:"status"`
+}

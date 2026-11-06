@@ -129,6 +129,14 @@ type ReplyNotificationArgs struct {
 	Content   string `json:"content" jsonschema:"回复内容"`
 }
 
+// SendGroupMessageArgs 网页私信群聊发送
+type SendGroupMessageArgs struct {
+	GroupChat string   `json:"group_chat" jsonschema:"群聊展示名称，须与创作平台「选择群聊」列表中的名称完全一致"`
+	Text      string   `json:"text,omitempty" jsonschema:"文字内容（可选）；与 images 至少填一项（dry_run 时可为空）"`
+	Images    []string `json:"images,omitempty" jsonschema:"本地图片路径列表（可选），仅 jpg/png；与 text 至少填一项（dry_run 时可为空）"`
+	DryRun    bool     `json:"dry_run,omitempty" jsonschema:"为 true 时只打开私信页并定位群聊，不发送任何内容"`
+}
+
 // InitMCPServer 初始化 MCP Server
 func InitMCPServer(appServer *AppServer) *mcp.Server {
 	// 创建 MCP Server
@@ -566,7 +574,36 @@ func registerTools(server *mcp.Server, appServer *AppServer) {
 		}),
 	)
 
-	logrus.Infof("Registered %d MCP tools", 18)
+	sendGroupSchema, err := jsonschema.For[SendGroupMessageArgs](nil)
+	if err != nil {
+		panic(fmt.Sprintf("send_group_message 参数 schema 生成失败: %v", err))
+	}
+	if gc := sendGroupSchema.Properties["group_chat"]; gc != nil {
+		gc.MinLength = jsonschema.Ptr(1)
+	}
+	mcp.AddTool(server,
+		&mcp.Tool{
+			Name:        "send_group_message",
+			Description: "在网页私信 (www.xiaohongshu.com/im) 中向展示名完全匹配的群聊发送本地图片与/或文字；依赖保存的 cookies。dry_run 为 true 时只打开并确认找到群聊。",
+			InputSchema: sendGroupSchema,
+			Annotations: &mcp.ToolAnnotations{
+				Title:           "Send Group Message",
+				DestructiveHint: boolPtr(true),
+			},
+		},
+		withPanicRecovery("send_group_message", func(ctx context.Context, req *mcp.CallToolRequest, args SendGroupMessageArgs) (*mcp.CallToolResult, any, error) {
+			argsMap := map[string]interface{}{
+				"group_chat": args.GroupChat,
+				"text":       args.Text,
+				"dry_run":    args.DryRun,
+				"images":     convertStringsToInterfaces(args.Images),
+			}
+			result := appServer.handleSendGroupMessage(ctx, argsMap)
+			return convertToMCPResult(result), nil, nil
+		}),
+	)
+
+	logrus.Infof("Registered %d MCP tools", 19)
 }
 
 // convertToMCPResult 将自定义的 MCPToolResult 转换为官方 SDK 的格式

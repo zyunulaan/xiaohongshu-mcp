@@ -64,10 +64,55 @@ Token 缺失或无效时，接口返回 HTTP `401 Unauthorized`。命令行参�
 | POST | `/api/v1/feeds/comment/reply` | 回复评论 |
 | POST | `/api/v1/feeds/like` | 点赞/取消点赞 |
 | POST | `/api/v1/feeds/favorite` | 收藏/取消收藏 |
+| POST | `/api/v1/send_group_message` | 网页私信向群聊发消息（文字与/或本地图片） |
 
 ---
 
 ## API 端点
+
+### 群聊消息（网页私信）
+
+通过已保存的 cookies 打开小红书网页私信入口 `https://www.xiaohongshu.com/im`，在会话列表中按**展示名精确匹配**（与创作服务平台「选择群聊」一致，大小写不敏感）定位群聊，再发送内容。部分账号或地区可能无法在网页端使用私信；此时接口会返回明确错误且不会发送。
+
+**请求**
+
+```
+POST /api/v1/send_group_message
+Content-Type: application/json
+```
+
+```json
+{
+  "group_chat": "我的交流群",
+  "text": "大家好",
+  "images": ["/path/to/photo.png"],
+  "dry_run": false
+}
+```
+
+- `group_chat` (string, **必填**)：群聊展示名称。
+- `text` (string, 可选)：文字内容。
+- `images` (string[], 可选)：本地 **jpg/png** 绝对路径列表。**非 dry_run** 时 `text` 与 `images` 至少提供一项；服务端会在启动浏览器前检查路径存在。
+- `dry_run` (bool, 可选)：`true` 时仅打开私信页并定位群聊，不发送。
+
+**成功响应**
+
+```json
+{
+  "success": true,
+  "data": {
+    "group_chat": "我的交流群",
+    "dry_run": false,
+    "status": "消息已发送并校验出现在会话中"
+  },
+  "message": "群消息已发送"
+}
+```
+
+**说明**
+
+- 图片通过会话区的 `input[type=file]`（`accept` 含 `image`）上传；发送后通过会话主区域 `<img>` 数量增加确认已展示。
+- 若找不到群聊、网页提示不支持私信、或无法命中输入框/发送按钮，返回错误且不会发送。
 
 ### 1. 健康检查
 

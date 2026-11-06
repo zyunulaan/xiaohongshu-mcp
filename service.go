@@ -360,6 +360,31 @@ func (s *XiaohongshuService) PublishVideo(ctx context.Context, req *PublishVideo
 	return resp, nil
 }
 
+// SendGroupMessage 在网页私信中向展示名完全匹配的群聊发消息；dry_run 仅打开并校验找到群聊。
+func (s *XiaohongshuService) SendGroupMessage(ctx context.Context, req *SendGroupMessageRequest) (*SendGroupMessageResponse, error) {
+	in := xiaohongshu.GroupMessageInput{
+		GroupChat:  req.GroupChat,
+		Text:       req.Text,
+		ImagePaths: req.Images,
+		DryRun:     req.DryRun,
+	}
+	b := newBrowser()
+	defer b.Close()
+
+	page := b.NewPage()
+	defer page.Close()
+
+	result, err := xiaohongshu.SendGroupMessage(ctx, page, in)
+	if err != nil {
+		return nil, err
+	}
+	return &SendGroupMessageResponse{
+		GroupChat: result.GroupChat,
+		DryRun:    result.DryRun,
+		Status:    result.Status,
+	}, nil
+}
+
 // publishVideo 执行视频发布
 func (s *XiaohongshuService) publishVideo(ctx context.Context, content xiaohongshu.PublishVideoContent) error {
 	b := newBrowser()
