@@ -34,6 +34,7 @@ type PublishVideoArgs struct {
 	Title      string   `json:"title" jsonschema:"内容标题（小红书限制：最多20个中文字或英文单词）"`
 	Content    string   `json:"content" jsonschema:"正文内容，不包含以#开头的标签内容，所有话题标签都用tags参数来生成和提供即可"`
 	Video      string   `json:"video" jsonschema:"本地视频绝对路径（仅支持单个视频文件，如:/Users/user/video.mp4）"`
+	Cover      string   `json:"cover,omitempty" jsonschema:"可选自定义封面，本地图片绝对路径，仅 jpg/png（如:/Users/user/cover.jpg）。提供时会在发布后等待封面预览更新；不填则沿用默认视频帧"`
 	Tags       []string `json:"tags,omitempty" jsonschema:"话题标签列表（可选参数），如 [美食, 旅行, 生活]"`
 	ScheduleAt string   `json:"schedule_at,omitempty" jsonschema:"定时发布时间（可选），ISO8601格式如 2024-01-20T10:30:00+08:00，支持1小时至14天内。不填则立即发布"`
 	IsOriginal bool     `json:"is_original,omitempty" jsonschema:"是否声明原创（可选），true为声明原创，false或不填则不声明"`
@@ -430,6 +431,7 @@ func registerTools(server *mcp.Server, appServer *AppServer) {
 				"title":       args.Title,
 				"content":     args.Content,
 				"video":       args.Video,
+				"cover":       args.Cover,
 				"tags":        convertStringsToInterfaces(args.Tags),
 				"schedule_at": args.ScheduleAt,
 				"is_original": args.IsOriginal,

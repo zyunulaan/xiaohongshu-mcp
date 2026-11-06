@@ -864,6 +864,7 @@ After successful connection, you can use the following MCP tools:
   - `group_chat`: Link a group chat (optional). Pass the group display name as shown in Creator Platform under 「选择群聊」. If the name cannot be matched, the tool returns an error listing available groups and does not publish. Omit to skip linking.
 - `publish_with_video` - Publish video content to RedNote (required: title, content, video)
   - `video`: Local video file absolute path (single file only)
+  - `cover`: Custom cover image (optional), local absolute path, jpg/png only. After the video is uploaded and processed, the flow opens the cover editor, uploads the image, confirms, then continues with title/body/etc.; omit to keep the default frame
   - `tags`: Topic tags list (optional), e.g. `["food", "travel", "lifestyle"]`
   - `schedule_at`: Scheduled publish time (optional), ISO8601 format, supports 1 hour to 14 days ahead
   - `visibility`: Visibility scope (optional), supports `公开可见` / public (default), `仅自己可见` / self-only, `仅互关好友可见` / mutual-followers-only

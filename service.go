@@ -68,6 +68,7 @@ type PublishVideoRequest struct {
 	Title      string   `json:"title" binding:"required"`
 	Content    string   `json:"content" binding:"required"`
 	Video      string   `json:"video" binding:"required"`
+	Cover      string   `json:"cover,omitempty"` // 可选自定义封面，本地 jpg/png 绝对路径
 	Tags       []string `json:"tags,omitempty"`
 	ScheduleAt string   `json:"schedule_at,omitempty"` // 定时发布时间，ISO8601格式，为空则立即发布
 	IsOriginal bool     `json:"is_original,omitempty"` // 是否声明原创
@@ -304,6 +305,9 @@ func (s *XiaohongshuService) PublishVideo(ctx context.Context, req *PublishVideo
 	if _, err := os.Stat(req.Video); err != nil {
 		return nil, fmt.Errorf("视频文件不存在或不可访问: %v", err)
 	}
+	if err := xiaohongshu.ValidateVideoCoverPath(req.Cover); err != nil {
+		return nil, err
+	}
 
 	var scheduleTime *time.Time
 	if req.ScheduleAt != "" {
@@ -335,6 +339,7 @@ func (s *XiaohongshuService) PublishVideo(ctx context.Context, req *PublishVideo
 		Content:      req.Content,
 		Tags:         req.Tags,
 		VideoPath:    req.Video,
+		CoverPath:    req.Cover,
 		ScheduleTime: scheduleTime,
 		IsOriginal:   req.IsOriginal,
 		Visibility:   req.Visibility,
