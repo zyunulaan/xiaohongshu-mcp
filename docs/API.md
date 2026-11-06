@@ -78,9 +78,10 @@ Token 缺失或无效时，接口返回 HTTP `401 Unauthorized`。命令行参�
 **调试文件**（与 `cookies.json` 同目录）：
 - `send_group_message_debug_<ms>_explore.png/.html/*_explore_url.txt`
 - `send_group_message_debug_<ms>_chat.png/.html/*_chat_url.txt`（进入 /chat 后即写入）
-- 失败或 panic 时另有无前缀 `_explore`/`_chat` 后缀的 `send_group_message_debug_<ms>.*` 当前页快照
+- `send_group_message_debug_<ms>_conv.png/.html/*_conv_url.txt`（点击左侧群聊打开右侧面板后写入，便于查看 composer DOM）
+- 失败或 panic 时另有无前缀 `_explore`/`_chat`/`_conv` 后缀的 `send_group_message_debug_<ms>.*` 当前页快照（调试保存使用独立短超时）
 
-**dry_run 成功** 时 `data` 含 `chat_snapshot` 与 `dry_run_diagnostics`（匹配到的文本、粗略 selector、`input_visible`、`scroll_attempts`、`chat_url`）。
+**dry_run 成功** 时 `data` 含 `chat_snapshot`、`conversation_snapshot`（`*_conv`）与 `dry_run_diagnostics`（匹配到的文本、粗略 selector、`input_visible`、`scroll_attempts`、`chat_url`）。
 
 **请求**
 
@@ -120,7 +121,7 @@ Content-Type: application/json
 **说明**
 
 - 图片通过会话区的 `input[type=file]`（`accept` 含 `image`）上传；发送后通过会话主区域 `<img>` 数量增加确认已展示。
-- 若找不到群聊、网页提示不支持私信、展示登录墙、**约 25s** 内无会话列表布局、或（非 dry_run）无法命中输入框/发送按钮，返回错误且不会发送（并见上方调试文件）。
+- 若找不到群聊、网页提示不支持私信、展示登录墙、**约 25s** 内无会话列表布局、或（非 dry_run）无法命中输入框，返回错误且不会发送（并见上方调试文件）。文本发送若找不到「发送」按钮会尝试 **回车**；发送后在**右侧消息区**轮询确认内容出现（不仅依赖 `document.body`）。
 
 ### 1. 健康检查
 

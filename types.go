@@ -153,9 +153,10 @@ type SendGroupMessageRequest struct {
 
 // SendGroupMessageResponse 群聊发送结果
 type SendGroupMessageResponse struct {
-	GroupChat         string                              `json:"group_chat"`
-	DryRun            bool                                `json:"dry_run"`
-	Status            string                              `json:"status"`
-	ChatSnapshot      *xiaohongshu.GroupMessageSnapshot   `json:"chat_snapshot,omitempty"`
-	DryRunDiagnostics *xiaohongshu.GroupDryRunDiagnostics `json:"dry_run_diagnostics,omitempty"`
+	GroupChat            string                              `json:"group_chat"`
+	DryRun               bool                                `json:"dry_run"`
+	Status               string                              `json:"status"`
+	ChatSnapshot         *xiaohongshu.GroupMessageSnapshot   `json:"chat_snapshot,omitempty"`
+	ConversationSnapshot *xiaohongshu.GroupMessageSnapshot   `json:"conversation_snapshot,omitempty"`
+	DryRunDiagnostics    *xiaohongshu.GroupDryRunDiagnostics `json:"dry_run_diagnostics,omitempty"`
 }

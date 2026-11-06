@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/go-rod/rod"
+	"github.com/go-rod/rod/lib/input"
+	"github.com/go-rod/rod/lib/proto"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/xpzouying/xiaohongshu-mcp/humanize"
@@ -21,6 +23,8 @@ const (
 	groupMessageOverallTimeout = 120 * time.Second
 	conversationListMaxWait    = 25 * time.Second // /chat 会话列表就绪
 	sendVerifyTimeout          = 25 * time.Second
+	composerFindTimeout        = 20 * time.Second
+	stepOperationTimeout       = 45 * time.Second
 	navAttemptTimeout          = 15 * time.Second
 	waitLoadShort              = 10 * time.Second
 	waitStableShort            = 2 * time.Second
@@ -55,11 +59,12 @@ type GroupDryRunDiagnostics struct {
 
 // GroupMessageResult 发送结果摘要。
 type GroupMessageResult struct {
-	GroupChat         string                  `json:"group_chat"`
-	DryRun            bool                    `json:"dry_run"`
-	Status            string                  `json:"status"`
-	ChatSnapshot      *GroupMessageSnapshot   `json:"chat_snapshot,omitempty"`
-	DryRunDiagnostics *GroupDryRunDiagnostics `json:"dry_run_diagnostics,omitempty"`
+	GroupChat            string                  `json:"group_chat"`
+	DryRun               bool                    `json:"dry_run"`
+	Status               string                  `json:"status"`
+	ChatSnapshot         *GroupMessageSnapshot   `json:"chat_snapshot,omitempty"`
+	ConversationSnapshot *GroupMessageSnapshot   `json:"conversation_snapshot,omitempty"`
+	DryRunDiagnostics    *GroupDryRunDiagnostics `json:"dry_run_diagnostics,omitempty"`
 }
 
 // ValidateGroupMessageInput 校验参数并在启动浏览器前检查本地图片路径。
@@ -100,11 +105,12 @@ func ValidateGroupMessageInput(in GroupMessageInput) error {
 func SendGroupMessage(ctx context.Context, page *rod.Page, in GroupMessageInput, debugArtifactsDir string) (res *GroupMessageResult, err error) {
 	var exploreSnap sendGroupDebugPaths
 	var chatSnap sendGroupDebugPaths
+	var convSnap sendGroupDebugPaths
 	defer func() {
 		if r := recover(); r != nil {
 			err = errors.Errorf("send_group_message panic: %v", r)
 			if debugArtifactsDir != "" && page != nil {
-				paths, se := saveSendGroupMessageDebug(page, debugArtifactsDir)
+				paths, se := saveSendGroupMessageDebugFresh(page, debugArtifactsDir)
 				if se != nil {
 					err = errors.Wrap(se, err.Error())
 				} else {
@@ -117,6 +123,9 @@ func SendGroupMessage(ctx context.Context, page *rod.Page, in GroupMessageInput,
 			if chatSnap.png != "" || chatSnap.html != "" {
 				err = errors.Errorf("%v; chat 快照: png=%s html=%s url_file=%s", err, chatSnap.png, chatSnap.html, chatSnap.urlFile)
 			}
+			if convSnap.png != "" || convSnap.html != "" {
+				err = errors.Errorf("%v; 会话快照: png=%s html=%s url_file=%s", err, convSnap.png, convSnap.html, convSnap.urlFile)
+			}
 			res = nil
 		}
 	}()
@@ -125,27 +134,29 @@ func SendGroupMessage(ctx context.Context, page *rod.Page, in GroupMessageInput,
 		return nil, e
 	}
 
-	pp := page.Context(ctx).Timeout(groupMessageOverallTimeout)
+	pp := page.Context(context.Background()).Timeout(groupMessageOverallTimeout)
 
-	err = openChatPage(ctx, pp, debugArtifactsDir, &exploreSnap, &chatSnap)
+	err = openChatPage(pp, debugArtifactsDir, &exploreSnap, &chatSnap)
 	if err != nil {
-		return nil, wrapWithSendGroupDebugExtra(pp, debugArtifactsDir, err, formatExploreChatPrefix(exploreSnap, chatSnap))
+		return nil, wrapWithSendGroupDebugExtra(pp, debugArtifactsDir, err, formatExploreChatPrefix(exploreSnap, chatSnap, sendGroupDebugPaths{}))
 	}
 
-	diag, err := findAndOpenGroupConversation(pp, in.GroupChat, in.DryRun)
+	diag, convSnap, err := findAndOpenGroupConversation(pp, in.GroupChat, in.DryRun, debugArtifactsDir)
 	if err != nil {
-		return nil, wrapWithSendGroupDebugExtra(pp, debugArtifactsDir, err, formatExploreChatPrefix(exploreSnap, chatSnap))
+		return nil, wrapWithSendGroupDebugExtra(pp, debugArtifactsDir, err, formatExploreChatPrefix(exploreSnap, chatSnap, convSnap))
 	}
 
 	snapPtr := debugPathsToSnapshot(chatSnap)
+	convPtr := debugPathsToSnapshot(convSnap)
 
 	if in.DryRun {
 		out := &GroupMessageResult{
-			GroupChat:         in.GroupChat,
-			DryRun:            true,
-			Status:            "dry_run：已在 /chat 打开群聊且输入框可见（未发送）",
-			ChatSnapshot:      snapPtr,
-			DryRunDiagnostics: diag,
+			GroupChat:            in.GroupChat,
+			DryRun:               true,
+			Status:               "dry_run：已在 /chat 打开群聊且输入框可见（未发送）",
+			ChatSnapshot:         snapPtr,
+			ConversationSnapshot: convPtr,
+			DryRunDiagnostics:    diag,
 		}
 		if diag != nil && !diag.InputVisible {
 			out.Status = "dry_run：已点击群聊但未检测到输入框"
@@ -156,20 +167,21 @@ func SendGroupMessage(ctx context.Context, page *rod.Page, in GroupMessageInput,
 	for _, path := range in.ImagePaths {
 		path = strings.TrimSpace(path)
 		if err := sendOneImageMessage(pp, path); err != nil {
-			return nil, wrapWithSendGroupDebugExtra(pp, debugArtifactsDir, err, formatExploreChatPrefix(exploreSnap, chatSnap))
+			return nil, wrapWithSendGroupDebugExtra(pp, debugArtifactsDir, err, formatExploreChatPrefix(exploreSnap, chatSnap, convSnap))
 		}
 	}
 	if txt := strings.TrimSpace(in.Text); txt != "" {
 		if err := sendTextMessage(pp, txt); err != nil {
-			return nil, wrapWithSendGroupDebugExtra(pp, debugArtifactsDir, err, formatExploreChatPrefix(exploreSnap, chatSnap))
+			return nil, wrapWithSendGroupDebugExtra(pp, debugArtifactsDir, err, formatExploreChatPrefix(exploreSnap, chatSnap, convSnap))
 		}
 	}
 
 	return &GroupMessageResult{
-		GroupChat:    in.GroupChat,
-		DryRun:       false,
-		Status:       "消息已发送并校验出现在会话中",
-		ChatSnapshot: snapPtr,
+		GroupChat:            in.GroupChat,
+		DryRun:               false,
+		Status:               "消息已发送并校验出现在会话中",
+		ChatSnapshot:         snapPtr,
+		ConversationSnapshot: convPtr,
 	}, nil
 }
 
@@ -180,13 +192,16 @@ func debugPathsToSnapshot(p sendGroupDebugPaths) *GroupMessageSnapshot {
 	return &GroupMessageSnapshot{PNG: p.png, HTML: p.html, URLFile: p.urlFile}
 }
 
-func formatExploreChatPrefix(explore, chat sendGroupDebugPaths) string {
+func formatExploreChatPrefix(explore, chat, conv sendGroupDebugPaths) string {
 	var parts []string
 	if strings.TrimSpace(explore.png) != "" || strings.TrimSpace(explore.html) != "" {
 		parts = append(parts, fmt.Sprintf("explore 快照: png=%s html=%s url_file=%s", explore.png, explore.html, explore.urlFile))
 	}
 	if strings.TrimSpace(chat.png) != "" || strings.TrimSpace(chat.html) != "" {
 		parts = append(parts, fmt.Sprintf("chat 快照: png=%s html=%s url_file=%s", chat.png, chat.html, chat.urlFile))
+	}
+	if strings.TrimSpace(conv.png) != "" || strings.TrimSpace(conv.html) != "" {
+		parts = append(parts, fmt.Sprintf("会话快照: png=%s html=%s url_file=%s", conv.png, conv.html, conv.urlFile))
 	}
 	return strings.Join(parts, "; ")
 }
@@ -205,19 +220,19 @@ func softWaitStable(page *rod.Page, d time.Duration) error {
 	return page.WaitStable(d)
 }
 
-func softNavigate(ctx context.Context, page *rod.Page, rawURL string) error {
+func softNavigate(page *rod.Page, rawURL string) error {
 	rawURL = strings.TrimSpace(rawURL)
 	if rawURL == "" {
 		return errors.New("empty URL")
 	}
-	navCtx, cancel := context.WithTimeout(ctx, navAttemptTimeout)
+	navCtx, cancel := context.WithTimeout(context.Background(), navAttemptTimeout)
 	defer cancel()
 	p := page.Context(navCtx)
 	return p.Navigate(rawURL)
 }
 
-func softOpenExplore(ctx context.Context, page *rod.Page) error {
-	navCtx, cancel := context.WithTimeout(ctx, exploreNavTimeout)
+func softOpenExplore(page *rod.Page) error {
+	navCtx, cancel := context.WithTimeout(context.Background(), exploreNavTimeout)
 	defer cancel()
 	p := page.Context(navCtx)
 	if err := p.Navigate("https://www.xiaohongshu.com/explore"); err != nil {
@@ -233,14 +248,14 @@ func softOpenExplore(ctx context.Context, page *rod.Page) error {
 }
 
 // openChatPage explore → 登录检测 → explore 快照 → 点侧栏「消息」或直达 /chat → 保存 _chat 快照。
-func openChatPage(ctx context.Context, page *rod.Page, debugDir string, exploreOut, chatOut *sendGroupDebugPaths) error {
-	if err := softOpenExplore(ctx, page); err != nil {
+func openChatPage(page *rod.Page, debugDir string, exploreOut, chatOut *sendGroupDebugPaths) error {
+	if err := softOpenExplore(page); err != nil {
 		return errors.Wrap(err, "打开 explore 失败")
 	}
 	time.Sleep(500 * time.Millisecond)
 
 	loginAction := NewLogin(page)
-	isLoggedIn, err := loginAction.CheckLoggedInOnExploreLayout(ctx)
+	isLoggedIn, err := loginAction.CheckLoggedInOnExploreLayout(context.Background())
 	if err != nil {
 		return errors.Wrap(err, "检测登录态失败")
 	}
@@ -256,11 +271,11 @@ func openChatPage(ctx context.Context, page *rod.Page, debugDir string, exploreO
 		}
 	}
 
-	clicked := tryClickSidebarMessageLink(page, ctx)
+	clicked := tryClickSidebarMessageLink(page)
 	logrus.Infof("send_group_message: sidebar 消息链接点击: %v", clicked)
 	if !clicked {
 		logrus.Infof("send_group_message: 直达 %s", groupChatEntryURL)
-		if err := softNavigate(ctx, page, groupChatEntryURL); err != nil {
+		if err := softNavigate(page, groupChatEntryURL); err != nil {
 			logrus.Infof("send_group_message: navigate /chat err=%v（仍尝试读当前页）", err)
 		}
 	} else {
@@ -270,7 +285,7 @@ func openChatPage(ctx context.Context, page *rod.Page, debugDir string, exploreO
 		href := pageURLString(page)
 		if !strings.Contains(strings.ToLower(href), "/chat") {
 			logrus.Infof("send_group_message: 点击后 URL 不含 /chat，再导航 %s 当前=%q", groupChatEntryURL, href)
-			if err := softNavigate(ctx, page, groupChatEntryURL); err != nil {
+			if err := softNavigate(page, groupChatEntryURL); err != nil {
 				logrus.Infof("send_group_message: 二次 navigate /chat err=%v", err)
 			}
 		}
@@ -311,7 +326,7 @@ func pageURLString(page *rod.Page) string {
 }
 
 // tryClickSidebarMessageLink 点击侧栏 #im_chat_tab 或 span.channel「消息」所在链接。
-func tryClickSidebarMessageLink(page *rod.Page, ctx context.Context) bool {
+func tryClickSidebarMessageLink(page *rod.Page) bool {
 	res, err := page.Eval(`() => {
 		const byId = document.querySelector('#im_chat_tab');
 		if (byId) {
@@ -348,7 +363,7 @@ func tryClickSidebarMessageLink(page *rod.Page, ctx context.Context) bool {
 	if !res.Value.Bool() {
 		return false
 	}
-	humanize.Delay(ctx, humanize.AfterClick)
+	humanize.Delay(context.Background(), humanize.AfterClick)
 	return true
 }
 
@@ -412,11 +427,11 @@ func waitChatConversationList(page *rod.Page) error {
 	return errors.New("约 25s 内未在 /chat 检测到左侧会话列表布局")
 }
 
-// findAndOpenGroupConversation 左侧栏滚动查找群名（大小写不敏感），点击后校验输入框。
-func findAndOpenGroupConversation(page *rod.Page, groupName string, dryRun bool) (*GroupDryRunDiagnostics, error) {
+// findAndOpenGroupConversation 左侧栏滚动查找群名（大小写不敏感），点击后校验输入框并保存 *_conv 快照。
+func findAndOpenGroupConversation(page *rod.Page, groupName string, dryRun bool, debugDir string) (*GroupDryRunDiagnostics, sendGroupDebugPaths, error) {
 	want := strings.TrimSpace(groupName)
 	if want == "" {
-		return nil, errors.New("group_chat 为空")
+		return nil, sendGroupDebugPaths{}, errors.New("group_chat 为空")
 	}
 
 	var lastDiag *GroupDryRunDiagnostics
@@ -478,7 +493,7 @@ func findAndOpenGroupConversation(page *rod.Page, groupName string, dryRun bool)
 			return JSON.stringify({ found: false });
 		}`, want)
 		if err != nil {
-			return nil, errors.Wrap(err, "左侧栏查找群名脚本失败")
+			return nil, sendGroupDebugPaths{}, errors.Wrap(err, "左侧栏查找群名脚本失败")
 		}
 
 		var parsed struct {
@@ -488,7 +503,7 @@ func findAndOpenGroupConversation(page *rod.Page, groupName string, dryRun bool)
 			Tag      string `json:"tag"`
 		}
 		if uerr := json.Unmarshal([]byte(res.Value.String()), &parsed); uerr != nil {
-			return nil, uerr
+			return nil, sendGroupDebugPaths{}, uerr
 		}
 
 		if !parsed.Found {
@@ -540,7 +555,7 @@ func findAndOpenGroupConversation(page *rod.Page, groupName string, dryRun bool)
 			return false;
 		}`, want)
 		if err != nil {
-			return nil, errors.Wrap(err, "点击群聊项失败")
+			return nil, sendGroupDebugPaths{}, errors.Wrap(err, "点击群聊项失败")
 		}
 		if !clickRes.Value.Bool() {
 			scrollLeftPanelDown(page)
@@ -550,14 +565,29 @@ func findAndOpenGroupConversation(page *rod.Page, groupName string, dryRun bool)
 		_ = softWaitStable(page, waitStableShort)
 		time.Sleep(400 * time.Millisecond)
 
+		var convPaths sendGroupDebugPaths
+		if strings.TrimSpace(debugDir) != "" {
+			snap, errS := saveSendGroupConvSnapshot(page, debugDir)
+			convPaths = snap
+			if errS != nil {
+				logrus.Warnf("会话 composer 快照未完整保存: %v", errS)
+			}
+		}
+
 		inputVis := false
-		for poll := 0; poll < 15; poll++ {
-			inputVis = messageInputVisible(page)
-			if inputVis {
+		composerWaitCtx, composerWaitCancel := context.WithTimeout(context.Background(), composerFindTimeout)
+		pollPage := page.Context(composerWaitCtx).Timeout(composerFindTimeout)
+		for composerWaitCtx.Err() == nil {
+			v, errV := messageComposerVisible(pollPage)
+			if errV != nil {
+				logrus.Debugf("message composer poll: %v", errV)
+			} else if v {
+				inputVis = true
 				break
 			}
 			time.Sleep(200 * time.Millisecond)
 		}
+		composerWaitCancel()
 		diag := &GroupDryRunDiagnostics{
 			MatchedNameText: parsed.Text,
 			MatchedSelector: parsed.Selector,
@@ -567,17 +597,17 @@ func findAndOpenGroupConversation(page *rod.Page, groupName string, dryRun bool)
 		}
 		if dryRun {
 			if inputVis {
-				return diag, nil
+				return diag, convPaths, nil
 			}
-			return diag, errors.New("dry_run：已匹配并点击群名，但未检测到消息输入框")
+			return diag, convPaths, errors.New("dry_run：已匹配并点击群名，但未检测到消息输入框")
 		}
 		if !inputVis {
-			return diag, errors.New("已点击群聊但未发现消息输入框")
+			return diag, convPaths, errors.New("已点击群聊但未发现消息输入框")
 		}
-		return nil, nil
+		return diag, convPaths, nil
 	}
 
-	return lastDiag, errors.Wrapf(formatGroupChatNotFoundError(want, nil), "左侧栏滚动 %d 次后仍未匹配或未能点击群聊", maxLeftPanelScrollForGroup+1)
+	return lastDiag, sendGroupDebugPaths{}, errors.Wrapf(formatGroupChatNotFoundError(want, nil), "左侧栏滚动 %d 次后仍未匹配或未能点击群聊", maxLeftPanelScrollForGroup+1)
 }
 
 func scrollLeftPanelDown(page *rod.Page) {
@@ -601,12 +631,13 @@ func scrollLeftPanelDown(page *rod.Page) {
 	}`, leftPanelScrollStepPx)
 }
 
-func messageInputVisible(page *rod.Page) bool {
+// messageComposerVisible 与 dry_run / 发送路径共用：可见 textarea 或 contenteditable。
+func messageComposerVisible(page *rod.Page) (bool, error) {
 	res, err := page.Eval(`() => {
 		const vis = (el) => {
 			if (!el) return false;
 			const st = window.getComputedStyle(el);
-			if (st.display === 'none' || st.visibility === 'hidden') return false;
+			if (st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') < 0.05) return false;
 			const r = el.getBoundingClientRect();
 			return r.width > 10 && r.height > 8;
 		};
@@ -619,9 +650,17 @@ func messageInputVisible(page *rod.Page) bool {
 		return false;
 	}`)
 	if err != nil {
+		return false, err
+	}
+	return res.Value.Bool(), nil
+}
+
+func messageInputVisible(page *rod.Page) bool {
+	ok, err := messageComposerVisible(page)
+	if err != nil {
 		return false
 	}
-	return res.Value.Bool()
+	return ok
 }
 
 func findChatImageFileInput(page *rod.Page) (*rod.Element, error) {
@@ -644,22 +683,31 @@ func findChatImageFileInput(page *rod.Page) (*rod.Element, error) {
 	return nil, errors.New("未找到图片上传 input")
 }
 
-func findChatTextInput(page *rod.Page) (*rod.Element, error) {
-	if ta, err := page.Element("textarea"); err == nil && ta != nil {
-		if vis, _ := ta.Visible(); vis {
-			return ta, nil
+// findChatComposerElement 与 dry_run 的可见性逻辑一致：优先可见 textarea，其次 contenteditable；返回真实 DOM 节点供 Focus/InsertText。
+func findChatComposerElement(page *rod.Page) (*rod.Element, error) {
+	res, err := page.Evaluate(rod.Eval(`() => {
+		const vis = (el) => {
+			if (!el) return false;
+			const st = window.getComputedStyle(el);
+			if (st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') < 0.05) return false;
+			const r = el.getBoundingClientRect();
+			return r.width > 10 && r.height > 8;
+		};
+		for (const ta of document.querySelectorAll('textarea')) {
+			if (vis(ta)) return ta;
 		}
-	}
-	list, err := page.Elements(`[contenteditable="true"]`)
+		for (const ed of document.querySelectorAll('[contenteditable="true"]')) {
+			if (vis(ed)) return ed;
+		}
+		return null;
+	}`).ByObject())
 	if err != nil {
 		return nil, err
 	}
-	for _, el := range list {
-		if vis, _ := el.Visible(); vis {
-			return el, nil
-		}
+	if res == nil || res.Subtype != proto.RuntimeRemoteObjectSubtypeNode {
+		return nil, errors.New("未找到可见文本输入框")
 	}
-	return nil, errors.New("未找到可见文本输入框")
+	return page.ElementFromObject(res)
 }
 
 func findSendButton(page *rod.Page) (*rod.Element, error) {
@@ -669,7 +717,7 @@ func findSendButton(page *rod.Page) (*rod.Element, error) {
 		`//*[self::button or self::div][contains(@class,"send")]`,
 	}
 	for _, xp := range candidates {
-		if el, err := page.Timeout(5 * time.Second).Element(`xpath=` + xp); err == nil && el != nil {
+		if el, err := page.Timeout(8 * time.Second).Element(`xpath=` + xp); err == nil && el != nil {
 			if vis, _ := el.Visible(); vis {
 				return el, nil
 			}
@@ -701,61 +749,104 @@ func sendOneImageMessage(page *rod.Page, path string) error {
 }
 
 func clickSendIfNeededAfterUpload(page *rod.Page) error {
-	btn, err := findSendButton(page)
+	opCtx, opCancel := context.WithTimeout(context.Background(), stepOperationTimeout)
+	defer opCancel()
+	op := page.Context(opCtx).Timeout(stepOperationTimeout)
+	btn, err := findSendButton(op)
 	if err != nil {
 		logrus.Infof("发送图片：未找到发送按钮，假设选中即发送: %v", err)
 		return nil
 	}
-	humanize.Delay(page.GetContext(), humanize.BeforeClick)
+	humanize.Delay(opCtx, humanize.BeforeClick)
 	if err := humanize.Click(btn); err != nil {
 		return errors.Wrap(err, "点击发送图片失败")
 	}
-	humanize.Delay(page.GetContext(), humanize.AfterClick)
+	humanize.Delay(opCtx, humanize.AfterClick)
 	_ = softWaitStable(page, waitStableShort)
 	return nil
 }
 
 func sendTextMessage(page *rod.Page, text string) error {
-	ti, err := findChatTextInput(page)
+	stepCtx, cancel := context.WithTimeout(context.Background(), stepOperationTimeout)
+	defer cancel()
+	op := page.Context(stepCtx).Timeout(stepOperationTimeout)
+
+	ti, err := findChatComposerElement(op)
 	if err != nil {
 		return errors.Wrap(err, "未找到文本输入框")
 	}
-	if err := humanize.Type(page.GetContext(), ti, text); err != nil {
+	typeCtx, typeCancel := context.WithTimeout(context.Background(), stepOperationTimeout)
+	defer typeCancel()
+	if err := humanize.Type(typeCtx, ti, text); err != nil {
 		return errors.Wrap(err, "输入文字失败")
 	}
-	btn, err := findSendButton(page)
-	if err != nil {
-		return errors.Wrap(err, "无法发送文字：未找到发送按钮")
+	humanize.Delay(typeCtx, humanize.AfterType)
+
+	btn, btnErr := findSendButton(op)
+	if btnErr == nil && btn != nil {
+		humanize.Delay(typeCtx, humanize.BeforeClick)
+		if err := humanize.Click(btn); err != nil {
+			return errors.Wrap(err, "点击发送文字失败")
+		}
+		humanize.Delay(typeCtx, humanize.AfterClick)
+	} else {
+		kbPage := page.Context(typeCtx)
+		if err := kbPage.Keyboard.Type(input.Enter); err != nil {
+			return errors.Wrap(err, "发送文字失败（无发送按钮且回车无效）")
+		}
+		humanize.Delay(typeCtx, humanize.AfterInteract)
 	}
-	humanize.Delay(page.GetContext(), humanize.BeforeClick)
-	if err := humanize.Click(btn); err != nil {
-		return errors.Wrap(err, "点击发送文字失败")
-	}
-	humanize.Delay(page.GetContext(), humanize.AfterClick)
 	_ = softWaitStable(page, waitStableShort)
-	if err := waitMessageAppears(page, text); err != nil {
+
+	verifyCtx, verifyCancel := context.WithTimeout(context.Background(), sendVerifyTimeout)
+	defer verifyCancel()
+	verifyPage := page.Context(verifyCtx).Timeout(sendVerifyTimeout)
+	if err := waitMessageAppearsInMessagePane(verifyPage, text); err != nil {
 		return errors.Wrap(err, "发送文字后未在会话中确认到消息")
 	}
 	return nil
 }
 
-func waitMessageAppears(page *rod.Page, marker string) error {
+// waitMessageAppearsInMessagePane 在右侧消息区域（非左侧列表）轮询 innerText 是否含发送内容。
+func waitMessageAppearsInMessagePane(page *rod.Page, marker string) error {
 	marker = strings.TrimSpace(marker)
 	if marker == "" {
 		return errors.New("消息内容为空")
 	}
 	deadline := time.Now().Add(sendVerifyTimeout)
 	for time.Now().Before(deadline) {
-		res, err := page.Eval(`() => document.body.innerText || ''`)
+		res, err := page.Eval(`(needle) => {
+			const w = window.innerWidth * 0.32;
+			let pane = null;
+			for (const el of document.querySelectorAll('[class*="message"], [class*="msg"], main, section, article')) {
+				const r = el.getBoundingClientRect();
+				if (r.left >= w && r.width > 80 && r.height > 80) { pane = el; break; }
+			}
+			if (!pane) {
+				for (const el of document.querySelectorAll('div')) {
+					const r = el.getBoundingClientRect();
+					if (r.left < w) continue;
+					if (el.querySelectorAll('img, video, textarea, [contenteditable="true"]').length >= 1 && r.width > 120) {
+						pane = el;
+						break;
+					}
+				}
+			}
+			const t = (pane && (pane.innerText || pane.textContent)) || (document.body.innerText || '');
+			return JSON.stringify({ hit: t.includes(needle), sampleLen: t.length });
+		}`, marker)
 		if err == nil {
-			body := res.Value.Str()
-			if strings.Contains(body, marker) {
+			var parsed struct {
+				Hit       bool `json:"hit"`
+				SampleLen int  `json:"sampleLen"`
+			}
+			if json.Unmarshal([]byte(res.Value.String()), &parsed) == nil && parsed.Hit {
 				return nil
 			}
 		}
 		time.Sleep(400 * time.Millisecond)
 	}
-	return errors.Errorf("超时：会话中未出现文字 %q", marker)
+	return errors.Errorf("超时：右侧消息区未出现文字 %q", marker)
 }
 
 func countMessagePaneImages(page *rod.Page) (int, error) {

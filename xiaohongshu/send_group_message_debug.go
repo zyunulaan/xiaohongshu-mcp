@@ -1,6 +1,7 @@
 package xiaohongshu
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,6 +11,8 @@ import (
 	"github.com/go-rod/rod"
 	"github.com/pkg/errors"
 )
+
+const debugSnapshotFreshTimeout = 15 * time.Second
 
 // wrapWithSendGroupDebug 失败时把整页截图、HTML、最终 URL 存到 cookies 文件同目录，并在错误文案里带上路径。
 func wrapWithSendGroupDebug(page *rod.Page, debugDir string, err error) error {
@@ -27,7 +30,7 @@ func wrapWithSendGroupDebugExtra(page *rod.Page, debugDir string, err error, ext
 		}
 		return err
 	}
-	paths, saveErr := saveSendGroupMessageDebug(page, debugDir)
+	paths, saveErr := saveSendGroupMessageDebugFresh(page, debugDir)
 	msg := fmt.Sprintf("调试: screenshot=%s html=%s url_file=%s", paths.png, paths.html, paths.urlFile)
 	if saveErr != nil {
 		msg = fmt.Sprintf("%s (调试保存部分失败: %v)", msg, saveErr)
@@ -46,14 +49,40 @@ func saveSendGroupMessageDebug(page *rod.Page, debugDir string) (sendGroupDebugP
 	return saveSendGroupPageSnapshot(page, debugDir, "")
 }
 
+// saveSendGroupMessageDebugFresh 用独立短超时保存，避免外层 ctx 已过期导致截图/HTML 失败。
+func saveSendGroupMessageDebugFresh(page *rod.Page, debugDir string) (sendGroupDebugPaths, error) {
+	if page == nil {
+		return sendGroupDebugPaths{}, errors.New("nil page")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), debugSnapshotFreshTimeout)
+	defer cancel()
+	p := page.Context(ctx)
+	return saveSendGroupPageSnapshot(p, debugDir, "")
+}
+
 // saveSendGroupExploreSnapshot 在尝试进入 IM 之前保存 explore 页快照（文件名带 _explore）。
 func saveSendGroupExploreSnapshot(page *rod.Page, debugDir string) (sendGroupDebugPaths, error) {
-	return saveSendGroupPageSnapshot(page, debugDir, "_explore")
+	return saveSendGroupPageSnapshotFresh(page, debugDir, "_explore")
 }
 
 // saveSendGroupChatSnapshot 进入网页私信 /chat 后保存快照（文件名带 _chat），供调整选择器。
 func saveSendGroupChatSnapshot(page *rod.Page, debugDir string) (sendGroupDebugPaths, error) {
-	return saveSendGroupPageSnapshot(page, debugDir, "_chat")
+	return saveSendGroupPageSnapshotFresh(page, debugDir, "_chat")
+}
+
+// saveSendGroupConvSnapshot 点击会话打开右侧面板后保存（*_conv），成功/失败均调用。
+func saveSendGroupConvSnapshot(page *rod.Page, debugDir string) (sendGroupDebugPaths, error) {
+	return saveSendGroupPageSnapshotFresh(page, debugDir, "_conv")
+}
+
+func saveSendGroupPageSnapshotFresh(page *rod.Page, debugDir string, nameSuffix string) (sendGroupDebugPaths, error) {
+	if page == nil {
+		return sendGroupDebugPaths{}, errors.New("nil page")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), debugSnapshotFreshTimeout)
+	defer cancel()
+	p := page.Context(ctx)
+	return saveSendGroupPageSnapshot(p, debugDir, nameSuffix)
 }
 
 func saveSendGroupPageSnapshot(page *rod.Page, debugDir string, nameSuffix string) (sendGroupDebugPaths, error) {
