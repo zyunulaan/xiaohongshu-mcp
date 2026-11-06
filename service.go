@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/go-rod/rod"
@@ -374,7 +375,8 @@ func (s *XiaohongshuService) SendGroupMessage(ctx context.Context, req *SendGrou
 	page := b.NewPage()
 	defer page.Close()
 
-	result, err := xiaohongshu.SendGroupMessage(ctx, page, in)
+	debugDir := filepath.Dir(cookies.GetCookiesFilePath())
+	result, err := xiaohongshu.SendGroupMessage(ctx, page, in, debugDir)
 	if err != nil {
 		return nil, err
 	}

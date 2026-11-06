@@ -18,8 +18,8 @@ const (
 	// groupIMEntryURL 网页私信入口（群聊与单聊均在此路由下，依赖账号与产品灰度）。
 	groupIMEntryURL = "https://www.xiaohongshu.com/im"
 
-	groupMessageOverallTimeout = 180 * time.Second
-	groupListWaitTimeout       = 20 * time.Second
+	groupMessageOverallTimeout = 90 * time.Second
+	imUILoadMaxWait            = 40 * time.Second // 非 IM 界面尽快失败（~40s）
 	afterNavigatePause         = 1200 * time.Millisecond
 	sendVerifyTimeout          = 25 * time.Second
 )
@@ -75,24 +75,22 @@ func ValidateGroupMessageInput(in GroupMessageInput) error {
 }
 
 // SendGroupMessage 打开私信页、按展示名精确匹配群聊并发送；dry_run 只打开并校验找到群聊。
-func SendGroupMessage(ctx context.Context, page *rod.Page, in GroupMessageInput) (*GroupMessageResult, error) {
+// debugArtifactsDir 非空时，失败会在该目录写入截图/HTML/URL 供排查。
+func SendGroupMessage(ctx context.Context, page *rod.Page, in GroupMessageInput, debugArtifactsDir string) (*GroupMessageResult, error) {
 	if err := ValidateGroupMessageInput(in); err != nil {
 		return nil, err
 	}
 
 	pp := page.Context(ctx).Timeout(groupMessageOverallTimeout)
 
-	if err := openGroupIMPage(pp); err != nil {
-		return nil, err
-	}
-	if err := ensureLoggedInSidebar(pp); err != nil {
-		return nil, err
+	if err := openGroupIMPage(ctx, pp); err != nil {
+		return nil, wrapWithSendGroupDebug(pp, debugArtifactsDir, err)
 	}
 	if err := waitConversationSidebar(pp); err != nil {
-		return nil, err
+		return nil, wrapWithSendGroupDebug(pp, debugArtifactsDir, err)
 	}
 	if err := openGroupConversation(pp, in.GroupChat); err != nil {
-		return nil, err
+		return nil, wrapWithSendGroupDebug(pp, debugArtifactsDir, err)
 	}
 	if in.DryRun {
 		return &GroupMessageResult{
@@ -105,12 +103,12 @@ func SendGroupMessage(ctx context.Context, page *rod.Page, in GroupMessageInput)
 	for _, path := range in.ImagePaths {
 		path = strings.TrimSpace(path)
 		if err := sendOneImageMessage(pp, path); err != nil {
-			return nil, err
+			return nil, wrapWithSendGroupDebug(pp, debugArtifactsDir, err)
 		}
 	}
 	if txt := strings.TrimSpace(in.Text); txt != "" {
 		if err := sendTextMessage(pp, txt); err != nil {
-			return nil, err
+			return nil, wrapWithSendGroupDebug(pp, debugArtifactsDir, err)
 		}
 	}
 
@@ -121,66 +119,142 @@ func SendGroupMessage(ctx context.Context, page *rod.Page, in GroupMessageInput)
 	}, nil
 }
 
-func openGroupIMPage(page *rod.Page) error {
-	page.MustNavigate(groupIMEntryURL).MustWaitLoad()
-	time.Sleep(afterNavigatePause)
-	page.MustWaitStable()
-	return nil
-}
+// openGroupIMPage 与 check_login_status 一致：先落地 explore 注入登录态，再用 LoginAction 检测；再尝试点「消息/私信」或直达 /im。
+func openGroupIMPage(ctx context.Context, page *rod.Page) error {
+	pp := page.Context(ctx).Timeout(60 * time.Second)
 
-// ensureLoggedInSidebar 与登录检查一致：侧栏应出现用户入口。
-func ensureLoggedInSidebar(page *rod.Page) error {
-	ok, _, err := page.Has(`.main-container .user .link-wrapper .channel`)
+	if err := NewNavigate(pp).ToExplorePage(ctx); err != nil {
+		return errors.Wrap(err, "打开 explore 失败")
+	}
+	time.Sleep(1000 * time.Millisecond)
+
+	loginAction := NewLogin(pp)
+	isLoggedIn, err := loginAction.CheckLoginStatus(ctx)
 	if err != nil {
 		return errors.Wrap(err, "检测登录态失败")
 	}
-	if !ok {
+	if !isLoggedIn {
 		return errors.New("未登录：请先使用扫码登录后再发送群消息")
 	}
+
+	// 尝试从侧栏进私信（单页应用内导航，cookie 与首页一致）
+	if err := tryClickMessageEntry(pp, ctx); err != nil {
+		logrus.Debugf("侧栏未点到消息入口，改直达 /im: %v", err)
+	}
+	if pageLooksLikeIM(pp) {
+		pp.MustWaitStable()
+		return nil
+	}
+
+	pp.Timeout(45 * time.Second).MustNavigate(groupIMEntryURL).MustWaitLoad()
+	time.Sleep(afterNavigatePause)
+	pp.MustWaitStable()
 	return nil
 }
 
-// waitConversationSidebar 等待左侧会话列表挂载；挂不到则视为当前页面不支持网页私信。
-func waitConversationSidebar(page *rod.Page) error {
-	deadline := time.Now().Add(groupListWaitTimeout)
-	for time.Now().Before(deadline) {
-		found, err := page.Eval(`() => {
-			const body = document.body.innerText || '';
-			if ((body.includes('暂不支持') && body.includes('私信')) || body.includes('请使用App') || body.includes('请使用 APP')) {
-				return 'unsupported';
+// tryClickMessageEntry 点击侧栏或顶栏文案为「消息」「私信」的入口。
+func tryClickMessageEntry(page *rod.Page, ctx context.Context) error {
+	res, err := page.Eval(`() => {
+		const labels = ['消息', '私信'];
+		const cand = Array.from(document.querySelectorAll('a, [role="link"], span, div'));
+		for (const el of cand) {
+			const t = (el.innerText || el.textContent || '').trim();
+			if (!labels.includes(t)) continue;
+			let n = el;
+			for (let i = 0; i < 8 && n; i++) {
+				if (n.tagName === 'A' || (n.getAttribute && n.getAttribute('role') === 'link')) {
+					n.click();
+					return true;
+				}
+				n = n.parentElement;
 			}
-			const qs = [
-				'[class*="conversation"]',
-				'[class*="session"]',
-				'[class*="session-list"]',
-				'[class*="chat-list"]',
-				'[class*="msg-list"]',
-				'.im-session-list',
-				'[class*="im-list"]'
-			];
-			for (const s of qs) {
-				const els = document.querySelectorAll(s);
-				for (const el of els) {
-					const r = el.getBoundingClientRect();
-					if (r.width > 80 && r.height > 120 && el.querySelectorAll('div, li').length >= 2) {
-						return 'ok';
-					}
+			el.click();
+			return true;
+		}
+		return false;
+	}`)
+	if err != nil {
+		return err
+	}
+	if !res.Value.Bool() {
+		return errors.New("未找到消息入口")
+	}
+	humanize.Delay(ctx, humanize.AfterClick)
+	return nil
+}
+
+// pageLooksLikeIM 当前是否已处于私信/IM 壳（URL 或会话列表区域）。
+func pageLooksLikeIM(page *rod.Page) bool {
+	res, err := page.Eval(`() => {
+		const href = location.href || '';
+		if (/\/im(\/|\?|#|$)/i.test(href)) return 'im';
+		const qs = [
+			'[class*="conversation"]',
+			'[class*="session"]',
+			'[class*="session-list"]',
+			'[class*="chat-list"]',
+			'[class*="msg-list"]',
+			'.im-session-list',
+			'[class*="im-list"]'
+		];
+		for (const s of qs) {
+			const els = document.querySelectorAll(s);
+			for (const el of els) {
+				const r = el.getBoundingClientRect();
+				if (r.width > 80 && r.height > 120 && el.querySelectorAll('div, li').length >= 2) {
+					return 'list';
 				}
 			}
-			return '';
-		}`)
-		if err != nil {
-			return errors.Wrap(err, "检测会话区域失败")
 		}
-		switch found.Value.Str() {
-		case "unsupported":
+		return '';
+	}`)
+	if err != nil {
+		return false
+	}
+	switch res.Value.Str() {
+	case "im", "list":
+		return true
+	default:
+		return false
+	}
+}
+
+// detectLoginWall explore / im 上若出现扫码登录容器，视为未带入会话。
+func detectLoginWall(page *rod.Page) bool {
+	res, err := page.Eval(`() => !!document.querySelector('.login-container .qrcode-img') || !!document.querySelector('.login-container')`)
+	if err != nil {
+		return false
+	}
+	return res.Value.Bool()
+}
+
+func detectUnsupportedIM(page *rod.Page) bool {
+	res, err := page.Eval(`() => {
+		const body = document.body.innerText || '';
+		if ((body.includes('暂不支持') && body.includes('私信')) || body.includes('请使用App') || body.includes('请使用 APP')) {
+			return true;
+		}
+		return false;
+	}`)
+	return err == nil && res.Value.Bool()
+}
+
+// waitConversationSidebar 等待 IM UI；40s 内既不是 IM 又不像登录墙则失败。
+func waitConversationSidebar(page *rod.Page) error {
+	deadline := time.Now().Add(imUILoadMaxWait)
+	for time.Now().Before(deadline) {
+		if detectLoginWall(page) {
+			return errors.New("当前页面展示登录界面，会话可能未生效：请先扫码登录或检查 cookies")
+		}
+		if detectUnsupportedIM(page) {
 			return errors.New("当前网页端不支持私信/群聊或该账号未开放网页消息：无法发送")
-		case "ok":
+		}
+		if pageLooksLikeIM(page) {
 			return nil
 		}
 		time.Sleep(300 * time.Millisecond)
 	}
-	return errors.New("等待私信会话列表超时：网页端可能不支持群聊或未展示会话列表")
+	return errors.New("40s 内未检测到网页私信/IM 界面（非 explore 首页布局），可能路由未进入 /im")
 }
 
 func openGroupConversation(page *rod.Page, groupName string) error {
@@ -197,7 +271,6 @@ func openGroupConversation(page *rod.Page, groupName string) error {
 
 func clickConversationByExactTitle(page *rod.Page, title string) error {
 	want := strings.TrimSpace(title)
-	// 精确匹配展示名（与创作平台 group_chat 一致），XPath 按规范拼接字面量。
 	xpath := fmt.Sprintf(`//*[normalize-space(string(.))=%s]`, xpathStringLiteral(want))
 	el, err := page.Timeout(25 * time.Second).Element("xpath=" + xpath)
 	if err != nil {
@@ -280,7 +353,6 @@ func findChatTextInput(page *rod.Page) (*rod.Element, error) {
 }
 
 func findSendButton(page *rod.Page) (*rod.Element, error) {
-	// 常见「发送」按钮文案
 	candidates := []string{
 		`//button[contains(normalize-space(.),"发送")]`,
 		`//div[@role="button"][contains(normalize-space(.),"发送")]`,
@@ -321,7 +393,6 @@ func sendOneImageMessage(page *rod.Page, path string) error {
 func clickSendIfNeededAfterUpload(page *rod.Page) error {
 	btn, err := findSendButton(page)
 	if err != nil {
-		// 部分交互是选中即发送，无单独按钮
 		logrus.Infof("发送图片：未找到发送按钮，假设选中即发送: %v", err)
 		return nil
 	}
@@ -410,7 +481,6 @@ func xpathStringLiteral(s string) string {
 	if !strings.Contains(s, `"`) {
 		return `"` + s + `"`
 	}
-	// XPath 1.0 concat 转义单引号
 	var b strings.Builder
 	parts := strings.Split(s, "'")
 	for i, p := range parts {
