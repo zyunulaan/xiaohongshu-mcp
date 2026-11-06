@@ -70,14 +70,17 @@ Token 缺失或无效时，接口返回 HTTP `401 Unauthorized`。命令行参�
 
 ## API 端点
 
-### 群聊消息（网页私信）
+### 群聊消息（网页私信 /chat）
 
-通过已保存的 cookies **先打开** `https://www.xiaohongshu.com/explore`（短超时、`Navigate`/`WaitLoad`/`WaitStable` 均非 `Must*`，导航超时也继续读当前文档），用侧栏 **`CheckLoggedInOnExploreLayout`**（与 `check_login_status` 同一选择器，但不重复导航）判断是否已登录。随后 **保存 explore 快照**（文件名带 `_explore` 后缀），再依次尝试：点击侧栏「消息」「私信」、从 explore 页面 HTML 解析出的站内「消息/私信/通知/im」等链接、`https://www.xiaohongshu.com/notification`、`https://www.xiaohongshu.com/im`，每次单独约 **15s** 导航超时，并写入服务日志。若检测到 IM 壳则继续。在会话列表中按**展示名精确匹配**定位群聊。**40 秒**内若仍无 IM 布局则失败。部分账号或地区无法使用网页私信时会返回明确错误。
+通过已保存的 cookies **先打开** `https://www.xiaohongshu.com/explore`（导航均带独立短超时、无 `Must*`），用侧栏 **`CheckLoggedInOnExploreLayout`**（与 `check_login_status` 同一 `.main-container .user ... .channel` 选择器）判断是否已登录。随后保存 **explore 快照**（`*_explore.*`），再 **优先点击侧栏「消息」**（如 `#im_chat_tab` / `span.channel`），若 URL 仍未进入 `/chat`，则导航到  
+`https://www.xiaohongshu.com/chat?channel_id=&channel_type=explore_feed`。进入后保存 **chat 快照**（`*_chat.*`，**含 dry_run 成功**），再 **最多约 25 秒** 等待左侧会话列表出现。左侧栏内 **滚动** 查找展示名与 `group_chat` **去空白后大小写不敏感**相等的可见文本，点击后检测右侧是否有 **textarea / contenteditable** 输入框。
 
-**失败调试**：任意步骤失败（含 **panic**）时，会在 **cookies 文件所在目录** 写入：
-- **失败瞬间页面**：`send_group_message_debug_<ms>.png/.html/*_url.txt`  
-- **进入 IM 前的 explore 页**（只要已生成）：`send_group_message_debug_<ms>_explore.png`、`.html`、`*_explore_url.txt`  
-错误信息中会附带路径，并包含已尝试的候选 URL 摘要。
+**调试文件**（与 `cookies.json` 同目录）：
+- `send_group_message_debug_<ms>_explore.png/.html/*_explore_url.txt`
+- `send_group_message_debug_<ms>_chat.png/.html/*_chat_url.txt`（进入 /chat 后即写入）
+- 失败或 panic 时另有无前缀 `_explore`/`_chat` 后缀的 `send_group_message_debug_<ms>.*` 当前页快照
+
+**dry_run 成功** 时 `data` 含 `chat_snapshot` 与 `dry_run_diagnostics`（匹配到的文本、粗略 selector、`input_visible`、`scroll_attempts`、`chat_url`）。
 
 **请求**
 
@@ -117,7 +120,7 @@ Content-Type: application/json
 **说明**
 
 - 图片通过会话区的 `input[type=file]`（`accept` 含 `image`）上传；发送后通过会话主区域 `<img>` 数量增加确认已展示。
-- 若找不到群聊、网页提示不支持私信、展示登录墙、**40s** 内无法识别为 IM 界面、或无法命中输入框/发送按钮，返回错误且不会发送（并见上方调试文件）。
+- 若找不到群聊、网页提示不支持私信、展示登录墙、**约 25s** 内无会话列表布局、或（非 dry_run）无法命中输入框/发送按钮，返回错误且不会发送（并见上方调试文件）。
 
 ### 1. 健康检查
 

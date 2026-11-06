@@ -51,6 +51,11 @@ func saveSendGroupExploreSnapshot(page *rod.Page, debugDir string) (sendGroupDeb
 	return saveSendGroupPageSnapshot(page, debugDir, "_explore")
 }
 
+// saveSendGroupChatSnapshot 进入网页私信 /chat 后保存快照（文件名带 _chat），供调整选择器。
+func saveSendGroupChatSnapshot(page *rod.Page, debugDir string) (sendGroupDebugPaths, error) {
+	return saveSendGroupPageSnapshot(page, debugDir, "_chat")
+}
+
 func saveSendGroupPageSnapshot(page *rod.Page, debugDir string, nameSuffix string) (sendGroupDebugPaths, error) {
 	var out sendGroupDebugPaths
 	if err := os.MkdirAll(debugDir, 0755); err != nil {

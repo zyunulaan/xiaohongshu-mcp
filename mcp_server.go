@@ -584,7 +584,7 @@ func registerTools(server *mcp.Server, appServer *AppServer) {
 	mcp.AddTool(server,
 		&mcp.Tool{
 			Name:        "send_group_message",
-			Description: "在网页私信 (www.xiaohongshu.com/im) 中向展示名完全匹配的群聊发送本地图片与/或文字；依赖保存的 cookies。dry_run 为 true 时只打开并确认找到群聊。",
+			Description: "在网页私信（www.xiaohongshu.com/chat，经 explore 侧栏「消息」）中向左侧会话列表里展示名匹配的群聊发送本地图片与/或文字；依赖保存的 cookies。dry_run 为 true 时打开 /chat、点击群聊并检测输入框，返回匹配信息与 _chat 调试快照路径。",
 			InputSchema: sendGroupSchema,
 			Annotations: &mcp.ToolAnnotations{
 				Title:           "Send Group Message",

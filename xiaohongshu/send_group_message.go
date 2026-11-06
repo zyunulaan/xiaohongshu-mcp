@@ -16,19 +16,20 @@ import (
 )
 
 const (
-	groupIMEntryURL = "https://www.xiaohongshu.com/im"
+	groupChatEntryURL = "https://www.xiaohongshu.com/chat?channel_id=&channel_type=explore_feed"
 
 	groupMessageOverallTimeout = 120 * time.Second
-	imUILoadMaxWait            = 40 * time.Second
+	conversationListMaxWait    = 25 * time.Second // /chat 会话列表就绪
 	sendVerifyTimeout          = 25 * time.Second
-
-	navAttemptTimeout = 15 * time.Second // 单次导航超时
-	waitLoadShort     = 8 * time.Second
-	waitStableShort   = 2 * time.Second
-	exploreNavTimeout = 22 * time.Second
+	navAttemptTimeout          = 15 * time.Second
+	waitLoadShort              = 10 * time.Second
+	waitStableShort            = 2 * time.Second
+	exploreNavTimeout          = 22 * time.Second
+	maxLeftPanelScrollForGroup = 14
+	leftPanelScrollStepPx      = 220
 )
 
-// GroupMessageInput 发送群聊消息的参数（网页私信）。
+// GroupMessageInput 发送群聊消息的参数（网页私信 /chat）。
 type GroupMessageInput struct {
 	GroupChat  string
 	Text       string
@@ -36,11 +37,29 @@ type GroupMessageInput struct {
 	DryRun     bool
 }
 
+// GroupMessageSnapshot 调试快照路径（_chat / _explore 等）。
+type GroupMessageSnapshot struct {
+	PNG     string `json:"png,omitempty"`
+	HTML    string `json:"html,omitempty"`
+	URLFile string `json:"url_file,omitempty"`
+}
+
+// GroupDryRunDiagnostics dry_run 时匹配的 DOM 信息。
+type GroupDryRunDiagnostics struct {
+	MatchedNameText string `json:"matched_name_text,omitempty"`
+	MatchedSelector string `json:"matched_selector,omitempty"`
+	InputVisible    bool   `json:"input_visible"`
+	ScrollAttempts  int    `json:"scroll_attempts"`
+	ChatURL         string `json:"chat_url,omitempty"`
+}
+
 // GroupMessageResult 发送结果摘要。
 type GroupMessageResult struct {
-	GroupChat string `json:"group_chat"`
-	DryRun    bool   `json:"dry_run"`
-	Status    string `json:"status"`
+	GroupChat         string                  `json:"group_chat"`
+	DryRun            bool                    `json:"dry_run"`
+	Status            string                  `json:"status"`
+	ChatSnapshot      *GroupMessageSnapshot   `json:"chat_snapshot,omitempty"`
+	DryRunDiagnostics *GroupDryRunDiagnostics `json:"dry_run_diagnostics,omitempty"`
 }
 
 // ValidateGroupMessageInput 校验参数并在启动浏览器前检查本地图片路径。
@@ -77,9 +96,10 @@ func ValidateGroupMessageInput(in GroupMessageInput) error {
 	return nil
 }
 
-// SendGroupMessage 打开私信页、按展示名精确匹配群聊并发送；dry_run 只打开并校验找到群聊。
+// SendGroupMessage 打开 /chat、在左侧列表匹配群聊并发送；dry_run 只校验并返回诊断信息。
 func SendGroupMessage(ctx context.Context, page *rod.Page, in GroupMessageInput, debugArtifactsDir string) (res *GroupMessageResult, err error) {
 	var exploreSnap sendGroupDebugPaths
+	var chatSnap sendGroupDebugPaths
 	defer func() {
 		if r := recover(); r != nil {
 			err = errors.Errorf("send_group_message panic: %v", r)
@@ -94,6 +114,9 @@ func SendGroupMessage(ctx context.Context, page *rod.Page, in GroupMessageInput,
 			if exploreSnap.png != "" || exploreSnap.html != "" {
 				err = errors.Errorf("%v; explore 快照: png=%s html=%s url_file=%s", err, exploreSnap.png, exploreSnap.html, exploreSnap.urlFile)
 			}
+			if chatSnap.png != "" || chatSnap.html != "" {
+				err = errors.Errorf("%v; chat 快照: png=%s html=%s url_file=%s", err, chatSnap.png, chatSnap.html, chatSnap.urlFile)
+			}
 			res = nil
 		}
 	}()
@@ -104,48 +127,68 @@ func SendGroupMessage(ctx context.Context, page *rod.Page, in GroupMessageInput,
 
 	pp := page.Context(ctx).Timeout(groupMessageOverallTimeout)
 
-	err = openGroupIMPage(ctx, pp, debugArtifactsDir, &exploreSnap)
+	err = openChatPage(ctx, pp, debugArtifactsDir, &exploreSnap, &chatSnap)
 	if err != nil {
-		return nil, wrapWithSendGroupDebugExtra(pp, debugArtifactsDir, err, formatExplorePrefix(exploreSnap))
+		return nil, wrapWithSendGroupDebugExtra(pp, debugArtifactsDir, err, formatExploreChatPrefix(exploreSnap, chatSnap))
 	}
-	if err := waitConversationSidebar(pp); err != nil {
-		return nil, wrapWithSendGroupDebugExtra(pp, debugArtifactsDir, err, formatExplorePrefix(exploreSnap))
+
+	diag, err := findAndOpenGroupConversation(pp, in.GroupChat, in.DryRun)
+	if err != nil {
+		return nil, wrapWithSendGroupDebugExtra(pp, debugArtifactsDir, err, formatExploreChatPrefix(exploreSnap, chatSnap))
 	}
-	if err := openGroupConversation(pp, in.GroupChat); err != nil {
-		return nil, wrapWithSendGroupDebugExtra(pp, debugArtifactsDir, err, formatExplorePrefix(exploreSnap))
-	}
+
+	snapPtr := debugPathsToSnapshot(chatSnap)
+
 	if in.DryRun {
-		return &GroupMessageResult{
-			GroupChat: in.GroupChat,
-			DryRun:    true,
-			Status:    "已找到群聊（dry_run，未发送）",
-		}, nil
+		out := &GroupMessageResult{
+			GroupChat:         in.GroupChat,
+			DryRun:            true,
+			Status:            "dry_run：已在 /chat 打开群聊且输入框可见（未发送）",
+			ChatSnapshot:      snapPtr,
+			DryRunDiagnostics: diag,
+		}
+		if diag != nil && !diag.InputVisible {
+			out.Status = "dry_run：已点击群聊但未检测到输入框"
+		}
+		return out, nil
 	}
 
 	for _, path := range in.ImagePaths {
 		path = strings.TrimSpace(path)
 		if err := sendOneImageMessage(pp, path); err != nil {
-			return nil, wrapWithSendGroupDebugExtra(pp, debugArtifactsDir, err, formatExplorePrefix(exploreSnap))
+			return nil, wrapWithSendGroupDebugExtra(pp, debugArtifactsDir, err, formatExploreChatPrefix(exploreSnap, chatSnap))
 		}
 	}
 	if txt := strings.TrimSpace(in.Text); txt != "" {
 		if err := sendTextMessage(pp, txt); err != nil {
-			return nil, wrapWithSendGroupDebugExtra(pp, debugArtifactsDir, err, formatExplorePrefix(exploreSnap))
+			return nil, wrapWithSendGroupDebugExtra(pp, debugArtifactsDir, err, formatExploreChatPrefix(exploreSnap, chatSnap))
 		}
 	}
 
 	return &GroupMessageResult{
-		GroupChat: in.GroupChat,
-		DryRun:    false,
-		Status:    "消息已发送并校验出现在会话中",
+		GroupChat:    in.GroupChat,
+		DryRun:       false,
+		Status:       "消息已发送并校验出现在会话中",
+		ChatSnapshot: snapPtr,
 	}, nil
 }
 
-func formatExplorePrefix(p sendGroupDebugPaths) string {
+func debugPathsToSnapshot(p sendGroupDebugPaths) *GroupMessageSnapshot {
 	if strings.TrimSpace(p.png) == "" && strings.TrimSpace(p.html) == "" {
-		return ""
+		return nil
 	}
-	return fmt.Sprintf("explore 快照: png=%s html=%s url_file=%s", p.png, p.html, p.urlFile)
+	return &GroupMessageSnapshot{PNG: p.png, HTML: p.html, URLFile: p.urlFile}
+}
+
+func formatExploreChatPrefix(explore, chat sendGroupDebugPaths) string {
+	var parts []string
+	if strings.TrimSpace(explore.png) != "" || strings.TrimSpace(explore.html) != "" {
+		parts = append(parts, fmt.Sprintf("explore 快照: png=%s html=%s url_file=%s", explore.png, explore.html, explore.urlFile))
+	}
+	if strings.TrimSpace(chat.png) != "" || strings.TrimSpace(chat.html) != "" {
+		parts = append(parts, fmt.Sprintf("chat 快照: png=%s html=%s url_file=%s", chat.png, chat.html, chat.urlFile))
+	}
+	return strings.Join(parts, "; ")
 }
 
 func softWaitLoad(page *rod.Page, d time.Duration) error {
@@ -173,7 +216,6 @@ func softNavigate(ctx context.Context, page *rod.Page, rawURL string) error {
 	return p.Navigate(rawURL)
 }
 
-// softOpenExplore 与 check_login_status 同址，但不使用 Must*，避免超时时 panic。
 func softOpenExplore(ctx context.Context, page *rod.Page) error {
 	navCtx, cancel := context.WithTimeout(ctx, exploreNavTimeout)
 	defer cancel()
@@ -190,12 +232,12 @@ func softOpenExplore(ctx context.Context, page *rod.Page) error {
 	return softWaitStable(p, waitStableShort)
 }
 
-// openGroupIMPage 先 soft explore + 侧栏登录检测，再保存 explore 快照（写入 *exploreSnapOut），依次尝试点击入口与多 URL。
-func openGroupIMPage(ctx context.Context, page *rod.Page, debugDir string, exploreSnapOut *sendGroupDebugPaths) error {
+// openChatPage explore → 登录检测 → explore 快照 → 点侧栏「消息」或直达 /chat → 保存 _chat 快照。
+func openChatPage(ctx context.Context, page *rod.Page, debugDir string, exploreOut, chatOut *sendGroupDebugPaths) error {
 	if err := softOpenExplore(ctx, page); err != nil {
 		return errors.Wrap(err, "打开 explore 失败")
 	}
-	time.Sleep(600 * time.Millisecond)
+	time.Sleep(500 * time.Millisecond)
 
 	loginAction := NewLogin(page)
 	isLoggedIn, err := loginAction.CheckLoggedInOnExploreLayout(ctx)
@@ -206,189 +248,138 @@ func openGroupIMPage(ctx context.Context, page *rod.Page, debugDir string, explo
 		return errors.New("未登录：请先使用扫码登录后再发送群消息")
 	}
 
-	if debugDir != "" && exploreSnapOut != nil {
+	if debugDir != "" && exploreOut != nil {
 		snap, errS := saveSendGroupExploreSnapshot(page, debugDir)
-		*exploreSnapOut = snap
+		*exploreOut = snap
 		if errS != nil {
 			logrus.Warnf("explore 快照未完整保存: %v", errS)
 		}
 	}
 
-	var tried []string
-	logTry := func(label, u string, navErr error) {
-		tried = append(tried, fmt.Sprintf("%s %s -> %v", label, u, errStr(navErr)))
-		logrus.Infof("send_group_message: try [%s] %s err=%v", label, u, navErr)
-	}
-
-	// 1) 侧栏「消息」「私信」点击
-	if err := tryClickMessageEntry(page, ctx); err == nil {
-		_ = softWaitStable(page, waitStableShort)
-		time.Sleep(500 * time.Millisecond)
-		if pageLooksLikeIM(page) {
-			_ = softWaitStable(page, 1500*time.Millisecond)
-			return nil
+	clicked := tryClickSidebarMessageLink(page, ctx)
+	logrus.Infof("send_group_message: sidebar 消息链接点击: %v", clicked)
+	if !clicked {
+		logrus.Infof("send_group_message: 直达 %s", groupChatEntryURL)
+		if err := softNavigate(ctx, page, groupChatEntryURL); err != nil {
+			logrus.Infof("send_group_message: navigate /chat err=%v（仍尝试读当前页）", err)
 		}
-		logTry("click_sidebar_message", "(in-page)", nil)
 	} else {
-		logrus.Debugf("未点到侧栏消息入口: %v", err)
-	}
-
-	// 2) 从 explore DOM 收集含 消息/私信/im 等关键词的站内链接
-	pageLinks, _ := collectExploreMessageLinks(page)
-
-	candidates := uniqueStringsOrdered(append(pageLinks,
-		"https://www.xiaohongshu.com/notification",
-		groupIMEntryURL,
-	))
-
-	for _, u := range candidates {
-		navErr := softNavigate(ctx, page, u)
-		logTry("navigate", u, navErr)
 		_ = softWaitLoad(page, waitLoadShort)
 		_ = softWaitStable(page, waitStableShort)
-		time.Sleep(400 * time.Millisecond)
-		if pageLooksLikeIM(page) {
-			return nil
-		}
-		// 导航超时仍继续读当前 document
-		if detectLoginWall(page) {
-			return errors.Errorf("已进入登录墙页面（已尝试: %s）", summarizeTried(tried))
-		}
-	}
-
-	return errors.Errorf("未能进入网页私信/IM（已尝试: %s）", summarizeTried(tried))
-}
-
-func errStr(e error) string {
-	if e == nil {
-		return "ok"
-	}
-	return e.Error()
-}
-
-func summarizeTried(tried []string) string {
-	if len(tried) == 0 {
-		return "(none)"
-	}
-	return strings.Join(tried, " | ")
-}
-
-func uniqueStringsOrdered(in []string) []string {
-	seen := map[string]bool{}
-	var out []string
-	for _, s := range in {
-		s = strings.TrimSpace(s)
-		if s == "" || seen[s] {
-			continue
-		}
-		seen[s] = true
-		out = append(out, s)
-	}
-	return out
-}
-
-// collectExploreMessageLinks 从当前页收集可能是消息/私信/群聊/通知 的站内链接。
-func collectExploreMessageLinks(page *rod.Page) ([]string, error) {
-	res, err := page.Eval(`() => {
-		const out = [];
-		const seen = new Set();
-		const keys = ['消息', '私信', '群聊', '通知', 'notification', 'chat', 'message', '/im', 'inbox'];
-		for (const a of document.querySelectorAll('a[href]')) {
-			const href = (a.getAttribute('href') || '').trim();
-			if (!href || href === '#' || href.startsWith('javascript:')) continue;
-			const text = (a.innerText || a.textContent || '').trim();
-			let abs;
-			try { abs = new URL(href, location.origin).href; } catch (e) { continue; }
-			if (!abs.includes('xiaohongshu.com')) continue;
-			const hay = (text + ' ' + href).toLowerCase();
-			let hit = false;
-			for (const k of keys) {
-				if (hay.includes(String(k).toLowerCase())) { hit = true; break; }
+		time.Sleep(600 * time.Millisecond)
+		href := pageURLString(page)
+		if !strings.Contains(strings.ToLower(href), "/chat") {
+			logrus.Infof("send_group_message: 点击后 URL 不含 /chat，再导航 %s 当前=%q", groupChatEntryURL, href)
+			if err := softNavigate(ctx, page, groupChatEntryURL); err != nil {
+				logrus.Infof("send_group_message: 二次 navigate /chat err=%v", err)
 			}
-			if (!hit) continue;
-			if (seen.has(abs)) continue;
-			seen.add(abs);
-			out.push(abs);
 		}
-		return JSON.stringify(out);
-	}`)
-	if err != nil {
-		return nil, err
 	}
-	raw := res.Value.String()
-	var list []string
-	if raw == "" {
-		return nil, nil
+
+	_ = softWaitLoad(page, waitLoadShort)
+	_ = softWaitStable(page, waitStableShort)
+	time.Sleep(400 * time.Millisecond)
+
+	if debugDir != "" && chatOut != nil {
+		snap, errS := saveSendGroupChatSnapshot(page, debugDir)
+		*chatOut = snap
+		if errS != nil {
+			logrus.Warnf("chat 快照未完整保存: %v", errS)
+		}
 	}
-	if uerr := json.Unmarshal([]byte(raw), &list); uerr != nil {
-		return nil, uerr
+
+	if detectLoginWall(page) {
+		return errors.New("当前页面展示登录界面，会话可能未生效")
 	}
-	return list, nil
+	if detectUnsupportedIM(page) {
+		return errors.New("当前网页端不支持私信/群聊或该账号未开放网页消息：无法发送")
+	}
+
+	if err := waitChatConversationList(page); err != nil {
+		href := pageURLString(page)
+		return errors.Wrapf(err, "当前 URL=%q", href)
+	}
+	return nil
 }
 
-func tryClickMessageEntry(page *rod.Page, ctx context.Context) error {
+func pageURLString(page *rod.Page) string {
+	info, err := page.Info()
+	if err != nil || info == nil {
+		return ""
+	}
+	return strings.TrimSpace(info.URL)
+}
+
+// tryClickSidebarMessageLink 点击侧栏 #im_chat_tab 或 span.channel「消息」所在链接。
+func tryClickSidebarMessageLink(page *rod.Page, ctx context.Context) bool {
 	res, err := page.Eval(`() => {
-		const labels = ['消息', '私信'];
-		const cand = Array.from(document.querySelectorAll('a, [role="link"], span, div'));
-		for (const el of cand) {
-			const t = (el.innerText || el.textContent || '').trim();
-			if (!labels.includes(t)) continue;
-			let n = el;
-			for (let i = 0; i < 8 && n; i++) {
-				if (n.tagName === 'A' || (n.getAttribute && n.getAttribute('role') === 'link')) {
+		const byId = document.querySelector('#im_chat_tab');
+		if (byId) {
+			let n = byId;
+			for (let i = 0; i < 12 && n; i++) {
+				if (n.tagName === 'A' && n.getAttribute('href')) {
 					n.click();
 					return true;
 				}
 				n = n.parentElement;
 			}
-			el.click();
+			byId.click();
 			return true;
+		}
+		const spans = Array.from(document.querySelectorAll('span.channel'));
+		for (const sp of spans) {
+			const t = (sp.innerText || sp.textContent || '').trim();
+			if (t !== '消息' && t !== '私信') continue;
+			let n = sp;
+			for (let i = 0; i < 12 && n; i++) {
+				if (n.tagName === 'A' && n.getAttribute('href')) {
+					n.click();
+					return true;
+				}
+				n = n.parentElement;
+			}
 		}
 		return false;
 	}`)
 	if err != nil {
-		return err
+		logrus.Debugf("tryClickSidebarMessageLink eval: %v", err)
+		return false
 	}
 	if !res.Value.Bool() {
-		return errors.New("未找到消息入口")
+		return false
 	}
 	humanize.Delay(ctx, humanize.AfterClick)
-	return nil
+	return true
 }
 
-func pageLooksLikeIM(page *rod.Page) bool {
+func pageLooksLikeChat(page *rod.Page) bool {
 	res, err := page.Eval(`() => {
-		const href = location.href || '';
-		if (/\/im(\/|\?|#|$)/i.test(href)) return 'im';
-		const qs = [
-			'[class*="conversation"]',
-			'[class*="session"]',
-			'[class*="session-list"]',
-			'[class*="chat-list"]',
-			'[class*="msg-list"]',
-			'.im-session-list',
-			'[class*="im-list"]'
+		const href = (location.href || '');
+		if (/\/chat(\/|\?|#|$)/i.test(href)) return true;
+		const leftSelectors = [
+			'[class*="session"]', '[class*="conversation"]', '[class*="chat-list"]',
+			'[class*="msg-list"]', '[class*="im-list"]', 'aside', 'nav'
 		];
-		for (const s of qs) {
-			const els = document.querySelectorAll(s);
-			for (const el of els) {
+		let best = null;
+		for (const sel of leftSelectors) {
+			for (const el of document.querySelectorAll(sel)) {
 				const r = el.getBoundingClientRect();
-				if (r.width > 80 && r.height > 120 && el.querySelectorAll('div, li').length >= 2) {
-					return 'list';
+				if (r.width < 60 || r.height < 100) continue;
+				if (r.left > window.innerWidth * 0.42) continue;
+				const rows = el.querySelectorAll('div, li, [role="listitem"], [role="button"]');
+				if (rows.length >= 2) {
+					if (!best || rows.length > best.cnt) {
+						best = { cnt: rows.length, w: r.width };
+					}
 				}
 			}
 		}
-		return '';
+		return best !== null && best.cnt >= 2;
 	}`)
 	if err != nil {
 		return false
 	}
-	switch res.Value.Str() {
-	case "im", "list":
-		return true
-	default:
-		return false
-	}
+	return res.Value.Bool()
 }
 
 func detectLoginWall(page *rod.Page) bool {
@@ -410,89 +401,227 @@ func detectUnsupportedIM(page *rod.Page) bool {
 	return err == nil && res.Value.Bool()
 }
 
-func waitConversationSidebar(page *rod.Page) error {
-	deadline := time.Now().Add(imUILoadMaxWait)
+func waitChatConversationList(page *rod.Page) error {
+	deadline := time.Now().Add(conversationListMaxWait)
 	for time.Now().Before(deadline) {
-		if detectLoginWall(page) {
-			return errors.New("当前页面展示登录界面，会话可能未生效：请先扫码登录或检查 cookies")
-		}
-		if detectUnsupportedIM(page) {
-			return errors.New("当前网页端不支持私信/群聊或该账号未开放网页消息：无法发送")
-		}
-		if pageLooksLikeIM(page) {
+		if pageLooksLikeChat(page) {
 			return nil
 		}
 		time.Sleep(300 * time.Millisecond)
 	}
-	return errors.New("40s 内未检测到网页私信/IM 界面（非 explore 首页布局），可能路由未进入 /im")
+	return errors.New("约 25s 内未在 /chat 检测到左侧会话列表布局")
 }
 
-func openGroupConversation(page *rod.Page, groupName string) error {
-	groupName = strings.TrimSpace(groupName)
-	if err := clickConversationByExactTitle(page, groupName); err != nil {
-		return err
+// findAndOpenGroupConversation 左侧栏滚动查找群名（大小写不敏感），点击后校验输入框。
+func findAndOpenGroupConversation(page *rod.Page, groupName string, dryRun bool) (*GroupDryRunDiagnostics, error) {
+	want := strings.TrimSpace(groupName)
+	if want == "" {
+		return nil, errors.New("group_chat 为空")
 	}
-	if err := waitActiveConversationTitle(page, groupName); err != nil {
-		return errors.Wrap(err, "打开会话后校验群名失败")
-	}
-	time.Sleep(500 * time.Millisecond)
-	return nil
-}
 
-func clickConversationByExactTitle(page *rod.Page, title string) error {
-	want := strings.TrimSpace(title)
-	xpath := fmt.Sprintf(`//*[normalize-space(string(.))=%s]`, xpathStringLiteral(want))
-	el, err := page.Timeout(25 * time.Second).Element("xpath=" + xpath)
-	if err != nil {
-		return errors.Wrap(formatGroupChatNotFoundError(want, nil), "未在会话列表中找到该群聊")
-	}
-	row := el
-	for i := 0; i < 8; i++ {
-		if row == nil {
-			break
-		}
-		tagJSON, errTag := row.Property("tagName")
-		if errTag == nil && strings.EqualFold(tagJSON.Str(), "li") {
-			break
-		}
-		parent, err := row.Parent()
+	var lastDiag *GroupDryRunDiagnostics
+	for attempt := 0; attempt <= maxLeftPanelScrollForGroup; attempt++ {
+		res, err := page.Eval(`(want) => {
+			const norm = (s) => String(s || '').trim();
+			const cmp = (a, b) => norm(a).toLowerCase() === norm(b).toLowerCase();
+			const visible = (el) => {
+				if (!el) return false;
+				const st = window.getComputedStyle(el);
+				if (st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') < 0.05) return false;
+				const r = el.getBoundingClientRect();
+				return r.width > 2 && r.height > 2 && r.bottom > 0 && r.right > 0;
+			};
+			const leftPanels = [];
+			const sels = ['aside', 'nav', '[class*="session"]', '[class*="conversation"]', '[class*="chat-list"]', '[class*="msg-list"]', '[class*="im-list"]', '[class*="list"]'];
+			for (const sel of sels) {
+				for (const el of document.querySelectorAll(sel)) {
+					const r = el.getBoundingClientRect();
+					if (r.width < 80 || r.height < 120) continue;
+					if (r.left > window.innerWidth * 0.45) continue;
+					leftPanels.push(el);
+				}
+			}
+			let root = leftPanels.reduce((a, b) => {
+				if (!a) return b;
+				const ra = a.getBoundingClientRect();
+				const rb = b.getBoundingClientRect();
+				return (a.querySelectorAll('div, li').length >= b.querySelectorAll('div, li').length) ? a : b;
+			}, null);
+			if (!root) root = document.body;
+
+			const cand = root.querySelectorAll('*');
+			for (const el of cand) {
+				if (!visible(el)) continue;
+				const t = (el.innerText || el.textContent || '').trim();
+				if (!t || t.length > 80) continue;
+				const lines = t.split(/\n/).map(x => x.trim()).filter(Boolean);
+				for (const line of lines) {
+					if (!cmp(line, want)) continue;
+					const tag = (el.tagName || '').toLowerCase();
+					let path = tag;
+					if (el.id) path += '#' + el.id;
+					if (el.className && typeof el.className === 'string') {
+						const c = el.className.trim().split(/\s+/).slice(0, 2).join('.');
+						if (c) path += '.' + c;
+					}
+					let clickEl = el;
+					for (let i = 0; i < 6 && clickEl; i++) {
+						const role = clickEl.getAttribute && clickEl.getAttribute('role');
+						if (clickEl.tagName === 'LI' || role === 'button' || role === 'option' || role === 'listitem') {
+							break;
+						}
+						clickEl = clickEl.parentElement;
+					}
+					return JSON.stringify({ found: true, text: line, selector: path, tag: tag });
+				}
+			}
+			return JSON.stringify({ found: false });
+		}`, want)
 		if err != nil {
-			break
+			return nil, errors.Wrap(err, "左侧栏查找群名脚本失败")
 		}
-		row = parent
-	}
-	humanize.Delay(page.GetContext(), humanize.BeforeClick)
-	clickTarget := row
-	if clickTarget == nil {
-		clickTarget = el
-	}
-	if err := humanize.Click(clickTarget); err != nil {
-		if err2 := humanize.Click(el); err2 != nil {
-			return errors.Wrap(err, "点击群聊会话失败")
+
+		var parsed struct {
+			Found    bool   `json:"found"`
+			Text     string `json:"text"`
+			Selector string `json:"selector"`
+			Tag      string `json:"tag"`
 		}
+		if uerr := json.Unmarshal([]byte(res.Value.String()), &parsed); uerr != nil {
+			return nil, uerr
+		}
+
+		if !parsed.Found {
+			scrollLeftPanelDown(page)
+			time.Sleep(220 * time.Millisecond)
+			lastDiag = &GroupDryRunDiagnostics{ScrollAttempts: attempt + 1, ChatURL: pageURLString(page)}
+			continue
+		}
+
+		clickRes, err := page.Eval(`(want) => {
+			const norm = (s) => String(s || '').trim();
+			const cmp = (a, b) => norm(a).toLowerCase() === norm(b).toLowerCase();
+			const visible = (el) => {
+				if (!el) return false;
+				const st = window.getComputedStyle(el);
+				if (st.display === 'none' || st.visibility === 'hidden') return false;
+				const r = el.getBoundingClientRect();
+				return r.width > 2 && r.height > 2;
+			};
+			const roots = document.querySelectorAll('aside, nav, [class*="session"], [class*="conversation"], [class*="chat-list"], [class*="msg-list"]');
+			let root = null;
+			let best = 0;
+			for (const el of roots) {
+				const r = el.getBoundingClientRect();
+				if (r.left > window.innerWidth * 0.45) continue;
+				const n = el.querySelectorAll('div, li').length;
+				if (n > best) { best = n; root = el; }
+			}
+			if (!root) root = document.body;
+			for (const el of root.querySelectorAll('*')) {
+				if (!visible(el)) continue;
+				const t = (el.innerText || el.textContent || '').trim();
+				if (!t || t.length > 80) continue;
+				for (const line of t.split(/\n/).map(x => x.trim()).filter(Boolean)) {
+					if (!cmp(line, want)) continue;
+					let clickEl = el;
+					for (let i = 0; i < 8 && clickEl; i++) {
+						const role = clickEl.getAttribute && clickEl.getAttribute('role');
+						if (clickEl.tagName === 'LI' || role === 'button' || role === 'option') {
+							clickEl.click();
+							return true;
+						}
+						clickEl = clickEl.parentElement;
+					}
+					el.click();
+					return true;
+				}
+			}
+			return false;
+		}`, want)
+		if err != nil {
+			return nil, errors.Wrap(err, "点击群聊项失败")
+		}
+		if !clickRes.Value.Bool() {
+			scrollLeftPanelDown(page)
+			continue
+		}
+
+		_ = softWaitStable(page, waitStableShort)
+		time.Sleep(400 * time.Millisecond)
+
+		inputVis := false
+		for poll := 0; poll < 15; poll++ {
+			inputVis = messageInputVisible(page)
+			if inputVis {
+				break
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+		diag := &GroupDryRunDiagnostics{
+			MatchedNameText: parsed.Text,
+			MatchedSelector: parsed.Selector,
+			InputVisible:    inputVis,
+			ScrollAttempts:  attempt,
+			ChatURL:         pageURLString(page),
+		}
+		if dryRun {
+			if inputVis {
+				return diag, nil
+			}
+			return diag, errors.New("dry_run：已匹配并点击群名，但未检测到消息输入框")
+		}
+		if !inputVis {
+			return diag, errors.New("已点击群聊但未发现消息输入框")
+		}
+		return nil, nil
 	}
-	humanize.Delay(page.GetContext(), humanize.AfterClick)
-	_ = softWaitStable(page, waitStableShort)
-	return nil
+
+	return lastDiag, errors.Wrapf(formatGroupChatNotFoundError(want, nil), "左侧栏滚动 %d 次后仍未匹配或未能点击群聊", maxLeftPanelScrollForGroup+1)
 }
 
-func waitActiveConversationTitle(page *rod.Page, title string) error {
-	deadline := time.Now().Add(15 * time.Second)
-	want := strings.TrimSpace(title)
-	for time.Now().Before(deadline) {
-		res, err := page.Eval(`() => document.body.innerText || ''`)
-		if err == nil {
-			body := res.Value.Str()
-			lines := strings.Split(body, "\n")
-			for _, line := range lines {
-				if groupChatNameMatches(strings.TrimSpace(line), want) {
-					return nil
+func scrollLeftPanelDown(page *rod.Page) {
+	_, _ = page.Eval(`(step) => {
+		const sels = ['aside', 'nav', '[class*="session"]', '[class*="conversation"]', '[class*="chat-list"]', '[class*="msg-list"]'];
+		let best = null;
+		let bestArea = 0;
+		for (const sel of sels) {
+			for (const el of document.querySelectorAll(sel)) {
+				const r = el.getBoundingClientRect();
+				if (r.left > window.innerWidth * 0.45) continue;
+				const area = r.width * r.height;
+				if (area > bestArea && r.height > 120) {
+					bestArea = area;
+					best = el;
 				}
 			}
 		}
-		time.Sleep(250 * time.Millisecond)
+		const target = best || document.documentElement;
+		target.scrollBy(0, step);
+	}`, leftPanelScrollStepPx)
+}
+
+func messageInputVisible(page *rod.Page) bool {
+	res, err := page.Eval(`() => {
+		const vis = (el) => {
+			if (!el) return false;
+			const st = window.getComputedStyle(el);
+			if (st.display === 'none' || st.visibility === 'hidden') return false;
+			const r = el.getBoundingClientRect();
+			return r.width > 10 && r.height > 8;
+		};
+		for (const ta of document.querySelectorAll('textarea')) {
+			if (vis(ta)) return true;
+		}
+		for (const ed of document.querySelectorAll('[contenteditable="true"]')) {
+			if (vis(ed)) return true;
+		}
+		return false;
+	}`)
+	if err != nil {
+		return false
 	}
-	return errors.Errorf("未在详情区看到群聊名称 %q（可能未打开或网页结构已变）", want)
+	return res.Value.Bool()
 }
 
 func findChatImageFileInput(page *rod.Page) (*rod.Element, error) {
@@ -517,9 +646,20 @@ func findChatImageFileInput(page *rod.Page) (*rod.Element, error) {
 
 func findChatTextInput(page *rod.Page) (*rod.Element, error) {
 	if ta, err := page.Element("textarea"); err == nil && ta != nil {
-		return ta, nil
+		if vis, _ := ta.Visible(); vis {
+			return ta, nil
+		}
 	}
-	return page.Element(`[contenteditable="true"]`)
+	list, err := page.Elements(`[contenteditable="true"]`)
+	if err != nil {
+		return nil, err
+	}
+	for _, el := range list {
+		if vis, _ := el.Visible(); vis {
+			return el, nil
+		}
+	}
+	return nil, errors.New("未找到可见文本输入框")
 }
 
 func findSendButton(page *rod.Page) (*rod.Element, error) {
@@ -620,11 +760,17 @@ func waitMessageAppears(page *rod.Page, marker string) error {
 
 func countMessagePaneImages(page *rod.Page) (int, error) {
 	res, err := page.Eval(`() => {
+		const w = window.innerWidth * 0.35;
 		const pane = document.querySelector('[class*="message"]') ||
 			document.querySelector('[class*="msg"]') ||
 			document.querySelector('main') ||
 			document.body;
-		return pane.querySelectorAll('img').length;
+		let n = 0;
+		for (const im of pane.querySelectorAll('img')) {
+			const r = im.getBoundingClientRect();
+			if (r.left >= w) n++;
+		}
+		return n;
 	}`)
 	if err != nil {
 		return 0, errors.Wrap(err, "统计会话区图片数量失败")
@@ -641,25 +787,5 @@ func waitImageMessageRendered(page *rod.Page, beforeCount int) error {
 		}
 		time.Sleep(400 * time.Millisecond)
 	}
-	return errors.New("超时：会话区 <img> 数量未增加（图片可能未发出或页面结构已变）")
-}
-
-func xpathStringLiteral(s string) string {
-	if !strings.Contains(s, "'") {
-		return "'" + s + "'"
-	}
-	if !strings.Contains(s, `"`) {
-		return `"` + s + `"`
-	}
-	var b strings.Builder
-	parts := strings.Split(s, "'")
-	for i, p := range parts {
-		if i > 0 {
-			b.WriteString(`,"'",`)
-		}
-		b.WriteString("'")
-		b.WriteString(p)
-		b.WriteString("'")
-	}
-	return "concat(" + b.String() + ")"
+	return errors.New("超时：会话区右侧 <img> 数量未增加（图片可能未发出或页面结构已变）")
 }

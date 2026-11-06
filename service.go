@@ -381,9 +381,11 @@ func (s *XiaohongshuService) SendGroupMessage(ctx context.Context, req *SendGrou
 		return nil, err
 	}
 	return &SendGroupMessageResponse{
-		GroupChat: result.GroupChat,
-		DryRun:    result.DryRun,
-		Status:    result.Status,
+		GroupChat:         result.GroupChat,
+		DryRun:            result.DryRun,
+		Status:            result.Status,
+		ChatSnapshot:      result.ChatSnapshot,
+		DryRunDiagnostics: result.DryRunDiagnostics,
 	}, nil
 }
 
