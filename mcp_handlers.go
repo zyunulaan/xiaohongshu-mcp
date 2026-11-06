@@ -228,13 +228,15 @@ func (s *AppServer) handlePublishVideo(ctx context.Context, args map[string]inte
 	visibility := parseVisibility(args)
 	isOriginal, _ := args["is_original"].(bool)
 	groupChat, _ := args["group_chat"].(string)
+	coverPath, _ := args["cover"].(string)
 
-	logrus.Infof("MCP: 发布视频 - 标题: %s, 标签数量: %d, 定时: %s, 原创: %v, visibility: %s, 商品: %v, 群聊: %s", title, len(tags), scheduleAt, isOriginal, visibility, products, groupChat)
+	logrus.Infof("MCP: 发布视频 - 标题: %s, 标签数量: %d, 定时: %s, 原创: %v, visibility: %s, 商品: %v, 群聊: %s, cover: %s", title, len(tags), scheduleAt, isOriginal, visibility, products, groupChat, coverPath)
 
 	req := &PublishVideoRequest{
 		Title:      title,
 		Content:    content,
 		Video:      videoPath,
+		Cover:      coverPath,
 		Tags:       tags,
 		ScheduleAt: scheduleAt,
 		IsOriginal: isOriginal,

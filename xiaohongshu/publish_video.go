@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/go-rod/rod"
@@ -18,6 +19,7 @@ type PublishVideoContent struct {
 	Content      string
 	Tags         []string
 	VideoPath    string
+	CoverPath    string     // 可选自定义封面，本地 jpg/png，空则使用默认帧
 	ScheduleTime *time.Time // 定时发布时间，nil 表示立即发布
 	IsOriginal   bool       // 是否声明原创
 	Visibility   string     // 可见范围: "公开可见"(默认), "仅自己可见", "仅互关好友可见"
@@ -68,6 +70,12 @@ func (p *PublishAction) PublishVideo(ctx context.Context, content PublishVideoCo
 
 	if err := uploadVideo(page, content.VideoPath); err != nil {
 		return errors.Wrap(err, "小红书上传视频失败")
+	}
+
+	if strings.TrimSpace(content.CoverPath) != "" {
+		if err := setCustomVideoCover(ctx, page, content.CoverPath); err != nil {
+			return errors.Wrap(err, "设置视频封面失败")
+		}
 	}
 
 	if err := submitPublishVideo(ctx, page, content.Title, content.Content, content.Tags, content.ScheduleTime, content.IsOriginal, content.Visibility, content.Products, content.GroupChat); err != nil {

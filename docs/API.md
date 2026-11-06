@@ -243,6 +243,7 @@ Content-Type: application/json
 - `title` (string, required): 视频标题
 - `content` (string, required): 视频内容描述
 - `video` (string, required): 本地视频文件绝对路径
+- `cover` (string, optional): 自定义封面图片本地绝对路径，仅 `jpg`/`png`。上传视频并处理完成后会打开封面编辑器上传该图并确认，再填写标题等；不填则使用默认视频帧
 - `tags` (array, optional): 标签数组
 - `schedule_at` (string, optional): 定时发布时间，ISO8601 格式如 `2024-01-20T10:30:00+08:00`，支持1小时至14天内。不填则立即发布
 - `visibility` (string, optional): 可见范围，支持: `公开可见`(默认)、`仅自己可见`、`仅互关好友可见`。不填则默认公开可见
@@ -265,6 +266,7 @@ Content-Type: application/json
 
 **注意事项:**
 - 仅支持本地视频文件路径，不支持 HTTP 链接
+- `cover` 须为服务端可访问的本地路径（例如容器内挂载目录）；无效路径或扩展名会在打开发布页面前返回错误
 - 视频处理时间较长，请耐心等待
 - 建议视频文件大小不超过 1GB
 
