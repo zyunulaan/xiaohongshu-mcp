@@ -2,6 +2,7 @@ package xiaohongshu
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -166,7 +167,7 @@ func SendGroupMessage(ctx context.Context, page *rod.Page, in GroupMessageInput,
 
 	for _, path := range in.ImagePaths {
 		path = strings.TrimSpace(path)
-		if err := sendOneImageMessage(pp, path); err != nil {
+		if err := sendOneImageMessage(pp, path, debugArtifactsDir); err != nil {
 			return nil, wrapWithSendGroupDebugExtra(pp, debugArtifactsDir, err, formatExploreChatPrefix(exploreSnap, chatSnap, convSnap))
 		}
 	}
@@ -663,26 +664,6 @@ func messageInputVisible(page *rod.Page) bool {
 	return ok
 }
 
-func findChatImageFileInput(page *rod.Page) (*rod.Element, error) {
-	inputs, err := page.Elements(`input[type=file]`)
-	if err != nil {
-		return nil, err
-	}
-	for _, inp := range inputs {
-		acc, _ := inp.Attribute("accept")
-		if acc != nil && strings.Contains(*acc, "image") {
-			return inp, nil
-		}
-	}
-	for _, inp := range inputs {
-		v, _ := inp.Visible()
-		if v {
-			return inp, nil
-		}
-	}
-	return nil, errors.New("未找到图片上传 input")
-}
-
 // findChatComposerElement 与 dry_run 的可见性逻辑一致：优先可见 textarea，其次 contenteditable；返回真实 DOM 节点供 Focus/InsertText。
 func findChatComposerElement(page *rod.Page) (*rod.Element, error) {
 	res, err := page.Evaluate(rod.Eval(`() => {
@@ -726,44 +707,287 @@ func findSendButton(page *rod.Page) (*rod.Element, error) {
 	return nil, errors.New("未找到发送按钮")
 }
 
-func sendOneImageMessage(page *rod.Page, path string) error {
-	inp, err := findChatImageFileInput(page)
+func groupImageMimeFromPath(path string) string {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".png":
+		return "image/png"
+	default:
+		return "application/octet-stream"
+	}
+}
+
+func readImageFileBase64(path string) (string, error) {
+	b, err := os.ReadFile(path)
 	if err != nil {
-		return errors.Wrap(err, "群聊不支持图片上传或当前页面无图片入口")
+		return "", err
 	}
-	before, err := countMessagePaneImages(page)
+	return base64.StdEncoding.EncodeToString(b), nil
+}
+
+// messagePaneImageStats 右侧会话区图片数量：优先统计疑似己方（右侧对齐）气泡内的 img，同时保留整区右侧 img 数作回退。
+func messagePaneImageStats(page *rod.Page) (userLike int, rightTotal int, err error) {
+	res, err := page.Eval(`() => {
+		const split = window.innerWidth * 0.32;
+		const roots = [];
+		const pv = document.querySelector('.xhs-im-view');
+		if (pv) roots.push(pv);
+		roots.push(document.body);
+		let userLike = 0;
+		let rightTotal = 0;
+		const seen = new Set();
+		for (const root of roots) {
+			for (const im of root.querySelectorAll('img')) {
+				if (seen.has(im)) continue;
+				const r = im.getBoundingClientRect();
+				if (r.left < split || r.width < 8 || r.height < 8) continue;
+				if (r.bottom < 0 || r.top > window.innerHeight) continue;
+				seen.add(im);
+				rightTotal++;
+				let p = im;
+				let selfSide = false;
+				for (let d = 0; d < 16 && p; d++) {
+					const cls = (p.className && String(p.className)) || '';
+					const st = window.getComputedStyle(p);
+					if (cls.includes('self') || cls.includes('mine') || cls.includes('sender-self') || cls.includes('msg-self') ||
+						st.alignSelf === 'flex-end' || (st.marginLeft === 'auto' && st.marginRight !== 'auto')) {
+						selfSide = true;
+						break;
+					}
+					p = p.parentElement;
+				}
+				if (selfSide) userLike++;
+			}
+		}
+		return JSON.stringify({ user_like: userLike, right_total: rightTotal });
+	}`)
 	if err != nil {
-		return err
+		return 0, 0, errors.Wrap(err, "统计会话区图片数量失败")
 	}
-	if err := inp.SetFiles([]string{path}); err != nil {
-		return errors.Wrap(err, "上传图片失败")
+	var parsed struct {
+		UserLike   int `json:"user_like"`
+		RightTotal int `json:"right_total"`
 	}
-	time.Sleep(800 * time.Millisecond)
-	if err := clickSendIfNeededAfterUpload(page); err != nil {
-		return err
+	if jerr := json.Unmarshal([]byte(res.Value.String()), &parsed); jerr != nil {
+		return 0, 0, jerr
 	}
-	if err := waitImageMessageRendered(page, before); err != nil {
-		return errors.Wrap(err, "发送图片后未在会话中确认到图片消息")
+	return parsed.UserLike, parsed.RightTotal, nil
+}
+
+// injectImageDataTransferEval 将本地图片以 File 注入 DataTransfer，按 method 触发 paste 或 drop。
+// method: "paste_editor" | "drop_editor" | "drop_view"
+func injectImageDataTransferEval(page *rod.Page, b64, mime, fileName, method string) error {
+	res, err := page.Eval(`(b64, mime, name, method) => {
+		const bin = atob(b64);
+		const bytes = new Uint8Array(bin.length);
+		for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+		const blob = new Blob([bytes], { type: mime || 'image/jpeg' });
+		const file = new File([blob], name || 'image.jpg', { type: mime || 'image/jpeg' });
+		const dt = new DataTransfer();
+		dt.items.add(file);
+
+		const editor = document.querySelector('.xhs-im-input-bar-editor[contenteditable="true"]') ||
+			document.querySelector('[contenteditable="true"]');
+		const view = document.querySelector('.xhs-im-view') ||
+			document.querySelector('[class*="im-view"]') ||
+			document.querySelector('main');
+
+		const dispatchPaste = (target) => {
+			if (!target) return { ok: false, err: 'no paste target' };
+			target.focus();
+			const ev = new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: dt });
+			const dispatched = target.dispatchEvent(ev);
+			return { ok: true, dispatched };
+		};
+
+		const dispatchDrop = (target) => {
+			if (!target) return { ok: false, err: 'no drop target' };
+			const r = target.getBoundingClientRect();
+			const clientX = r.left + Math.min(r.width * 0.5, 120);
+			const clientY = r.top + Math.min(r.height * 0.5, 120);
+			target.focus && target.focus();
+			const mk = (type) => new DragEvent(type, {
+				bubbles: true,
+				cancelable: true,
+				clientX,
+				clientY,
+				dataTransfer: dt
+			});
+			target.dispatchEvent(mk('dragenter'));
+			target.dispatchEvent(mk('dragover'));
+			const dropOk = target.dispatchEvent(mk('drop'));
+			return { ok: true, dispatched: dropOk };
+		};
+
+		let out;
+		if (method === 'paste_editor') {
+			out = dispatchPaste(editor);
+		} else if (method === 'drop_editor') {
+			out = dispatchDrop(editor);
+		} else if (method === 'drop_view') {
+			out = dispatchDrop(view || document.body);
+		} else {
+			return JSON.stringify({ ok: false, err: 'bad method' });
+		}
+		return JSON.stringify(out);
+	}`, b64, mime, fileName, method)
+	if err != nil {
+		return errors.Wrap(err, "注入图片脚本执行失败")
+	}
+	var parsed struct {
+		OK         bool   `json:"ok"`
+		Err        string `json:"err"`
+		Dispatched bool   `json:"dispatched"`
+	}
+	if uerr := json.Unmarshal([]byte(res.Value.String()), &parsed); uerr != nil {
+		return uerr
+	}
+	if !parsed.OK {
+		if strings.TrimSpace(parsed.Err) == "" {
+			return errors.New("注入图片失败")
+		}
+		return errors.New(parsed.Err)
 	}
 	return nil
 }
 
-func clickSendIfNeededAfterUpload(page *rod.Page) error {
+// clickImagePreviewOrConfirmButtons 若有预览弹窗，点击 发送/确定/确认。
+func clickImagePreviewOrConfirmButtons(page *rod.Page) error {
+	opCtx, opCancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer opCancel()
+	op := page.Context(opCtx).Timeout(8 * time.Second)
+	for attempt := 0; attempt < 4; attempt++ {
+		res, err := op.Eval(`() => {
+			const want = ['发送', '确定', '确认'];
+			const nodes = Array.from(document.querySelectorAll('button, [role="button"], div, span'));
+			for (const el of nodes) {
+				const t = (el.innerText || el.textContent || '').trim();
+				if (!t) continue;
+				if (!want.some(w => t === w || t.includes(w))) continue;
+				const r = el.getBoundingClientRect();
+				if (r.width < 2 || r.height < 2) continue;
+				el.click();
+				return true;
+			}
+			return false;
+		}`)
+		if err == nil && res.Value.Bool() {
+			humanize.Delay(opCtx, humanize.AfterClick)
+			_ = softWaitStable(page, waitStableShort)
+			return nil
+		}
+		time.Sleep(350 * time.Millisecond)
+	}
+	return nil
+}
+
+func confirmImageAfterInject(page *rod.Page) error {
+	_ = clickImagePreviewOrConfirmButtons(page)
 	opCtx, opCancel := context.WithTimeout(context.Background(), stepOperationTimeout)
 	defer opCancel()
 	op := page.Context(opCtx).Timeout(stepOperationTimeout)
-	btn, err := findSendButton(op)
-	if err != nil {
-		logrus.Infof("发送图片：未找到发送按钮，假设选中即发送: %v", err)
+	btn, btnErr := findSendButton(op)
+	if btnErr == nil && btn != nil {
+		humanize.Delay(opCtx, humanize.BeforeClick)
+		if err := humanize.Click(btn); err != nil {
+			return errors.Wrap(err, "点击发送图片失败")
+		}
+		humanize.Delay(opCtx, humanize.AfterClick)
+		_ = softWaitStable(page, waitStableShort)
 		return nil
 	}
-	humanize.Delay(opCtx, humanize.BeforeClick)
-	if err := humanize.Click(btn); err != nil {
-		return errors.Wrap(err, "点击发送图片失败")
+	kbPage := page.Context(opCtx)
+	if err := kbPage.Keyboard.Type(input.Enter); err != nil {
+		return errors.Wrap(err, "发送图片失败（无发送按钮且回车无效）")
 	}
-	humanize.Delay(opCtx, humanize.AfterClick)
+	humanize.Delay(opCtx, humanize.AfterInteract)
 	_ = softWaitStable(page, waitStableShort)
 	return nil
+}
+
+func waitImageMessageRenderedAfter(page *rod.Page, beforeUser, beforeRight int) error {
+	deadline := time.Now().Add(sendVerifyTimeout)
+	for time.Now().Before(deadline) {
+		u, rtot, err := messagePaneImageStats(page)
+		if err != nil {
+			time.Sleep(400 * time.Millisecond)
+			continue
+		}
+		if u > beforeUser {
+			return nil
+		}
+		if rtot > beforeRight {
+			return nil
+		}
+		time.Sleep(400 * time.Millisecond)
+	}
+	return errors.New("超时：会话区右侧未检测到新增图片消息")
+}
+
+func sendOneImageMessage(page *rod.Page, path string, debugDir string) error {
+	b64, err := readImageFileBase64(path)
+	if err != nil {
+		return errors.Wrap(err, "读取本地图片失败")
+	}
+	mime := groupImageMimeFromPath(path)
+	name := filepath.Base(path)
+
+	beforeU, beforeR, err := messagePaneImageStats(page)
+	if err != nil {
+		return err
+	}
+
+	methods := []struct {
+		tag string
+		key string
+	}{
+		{"paste", "paste_editor"},
+		{"drop_ed", "drop_editor"},
+		{"drop_view", "drop_view"},
+	}
+	var attemptLines []string
+	for _, m := range methods {
+		stepCtx, stepCancel := context.WithTimeout(context.Background(), stepOperationTimeout)
+		op := page.Context(stepCtx).Timeout(stepOperationTimeout)
+		injErr := injectImageDataTransferEval(op, b64, mime, name, m.key)
+		stepCancel()
+		if injErr != nil {
+			attemptLines = append(attemptLines, fmt.Sprintf("%s: 注入失败 — %v", m.tag, injErr))
+			if strings.TrimSpace(debugDir) != "" {
+				if _, se := saveSendGroupConvSnapshotAttempt(page, debugDir, "img_"+m.tag+"_fail"); se != nil {
+					logrus.Warnf("图片发送失败快照: %v", se)
+				}
+			}
+			continue
+		}
+
+		time.Sleep(400 * time.Millisecond)
+		_ = confirmImageAfterInject(page)
+
+		verifyCtx, verifyCancel := context.WithTimeout(context.Background(), sendVerifyTimeout)
+		vp := page.Context(verifyCtx).Timeout(sendVerifyTimeout)
+		waitErr := waitImageMessageRenderedAfter(vp, beforeU, beforeR)
+		verifyCancel()
+
+		if waitErr == nil {
+			return nil
+		}
+
+		attemptLines = append(attemptLines, fmt.Sprintf("%s: 已注入但未在消息区确认 — %v", m.tag, waitErr))
+
+		if strings.TrimSpace(debugDir) != "" {
+			if _, se := saveSendGroupConvSnapshotAttempt(page, debugDir, "img_"+m.tag+"_noverify"); se != nil {
+				logrus.Warnf("图片校验失败快照: %v", se)
+			}
+		}
+		// 为下一次尝试刷新基线（页面可能已插入预览图）
+		if u2, r2, e2 := messagePaneImageStats(page); e2 == nil {
+			beforeU, beforeR = u2, r2
+		}
+	}
+
+	return errors.Errorf("图片发送失败（顺序尝试 paste → drop_editor → drop_view）。%s", strings.Join(attemptLines, " | "))
 }
 
 func sendTextMessage(page *rod.Page, text string) error {
@@ -847,36 +1071,4 @@ func waitMessageAppearsInMessagePane(page *rod.Page, marker string) error {
 		time.Sleep(400 * time.Millisecond)
 	}
 	return errors.Errorf("超时：右侧消息区未出现文字 %q", marker)
-}
-
-func countMessagePaneImages(page *rod.Page) (int, error) {
-	res, err := page.Eval(`() => {
-		const w = window.innerWidth * 0.35;
-		const pane = document.querySelector('[class*="message"]') ||
-			document.querySelector('[class*="msg"]') ||
-			document.querySelector('main') ||
-			document.body;
-		let n = 0;
-		for (const im of pane.querySelectorAll('img')) {
-			const r = im.getBoundingClientRect();
-			if (r.left >= w) n++;
-		}
-		return n;
-	}`)
-	if err != nil {
-		return 0, errors.Wrap(err, "统计会话区图片数量失败")
-	}
-	return int(res.Value.Num()), nil
-}
-
-func waitImageMessageRendered(page *rod.Page, beforeCount int) error {
-	deadline := time.Now().Add(sendVerifyTimeout)
-	for time.Now().Before(deadline) {
-		n, err := countMessagePaneImages(page)
-		if err == nil && n > beforeCount {
-			return nil
-		}
-		time.Sleep(400 * time.Millisecond)
-	}
-	return errors.New("超时：会话区右侧 <img> 数量未增加（图片可能未发出或页面结构已变）")
 }

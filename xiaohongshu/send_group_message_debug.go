@@ -75,6 +75,15 @@ func saveSendGroupConvSnapshot(page *rod.Page, debugDir string) (sendGroupDebugP
 	return saveSendGroupPageSnapshotFresh(page, debugDir, "_conv")
 }
 
+// saveSendGroupConvSnapshotAttempt 打开会话后的调试快照；attemptTag 非空时文件名为 *_conv_<tag>（每次尝试可区分）。
+func saveSendGroupConvSnapshotAttempt(page *rod.Page, debugDir string, attemptTag string) (sendGroupDebugPaths, error) {
+	suffix := "_conv"
+	if strings.TrimSpace(attemptTag) != "" {
+		suffix = "_conv_" + strings.TrimSpace(attemptTag)
+	}
+	return saveSendGroupPageSnapshotFresh(page, debugDir, suffix)
+}
+
 func saveSendGroupPageSnapshotFresh(page *rod.Page, debugDir string, nameSuffix string) (sendGroupDebugPaths, error) {
 	if page == nil {
 		return sendGroupDebugPaths{}, errors.New("nil page")
