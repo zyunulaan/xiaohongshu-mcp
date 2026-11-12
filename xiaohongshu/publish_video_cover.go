@@ -35,6 +35,30 @@ func ValidateVideoCoverPath(path string) error {
 	}
 }
 
+// 创作者中心「设置封面」当前 DOM（2026-11 实测）：
+//   - 页面上的「设置封面」只是区块标题 span，不可点击。
+//   - 封面缩略图 `.cover-plugin-preview .cover .default`，鼠标悬停后才出现
+//     `.cover-edit-entry`（文案「编辑封面」，未悬停时 0×0）。
+//   - 点击后弹出 `.cover-modal.main-cover-editor-modal`，里面没有「上传封面」文案：
+//     上传入口是 `label.upload-btn`（文案「上传」）内的 `input[type=file]`
+//     （accept="image/png, image/jpeg, image/*"），上传成功后出现 `button.uploaded-thumbnail`。
+//   - 确认按钮是弹窗里的「完成」（不是「确定」）。
+//   - 首次进入时可能有「视频可以PK封面啦」引导气泡（按钮「我知道了」）盖住封面区。
+const (
+	coverTileSelector   = `.cover-plugin-preview .cover .default`
+	coverEntrySelector  = `.cover-edit-entry`
+	coverModalSelector  = `.cover-modal`
+	coverInputSelector  = `.cover-modal .upload-btn input[type='file']`
+	coverUploadedThumb  = `.cover-modal .uploaded-thumbnail`
+	coverGuideDismissJS = `() => {
+		const b = [...document.querySelectorAll('button, span, div')].find(e =>
+			e.children.length <= 1 && e.textContent.trim() === '我知道了');
+		if (!b) return false;
+		b.click();
+		return true;
+	}`
+)
+
 // setCustomVideoCover 在视频上传完成后打开封面编辑器，上传本地封面并确认。
 func setCustomVideoCover(ctx context.Context, page *rod.Page, coverPath string) error {
 	coverPath = strings.TrimSpace(coverPath)
@@ -46,6 +70,8 @@ func setCustomVideoCover(ctx context.Context, page *rod.Page, coverPath string) 
 	}
 
 	pp := page.Context(ctx).Timeout(120 * time.Second)
+
+	dismissCoverGuide(pp)
 
 	if err := clickVideoCoverEntry(pp); err != nil {
 		return errors.Wrap(err, "打开视频封面设置失败")
@@ -68,104 +94,112 @@ func setCustomVideoCover(ctx context.Context, page *rod.Page, coverPath string) 
 	return nil
 }
 
-// 入口文案：「设置封面」或「修改封面」（XPath 1：用 | 合并）
-const coverEntryXPath = `//*[contains(normalize-space(string(.)), '设置封面')] | //*[contains(normalize-space(string(.)), '修改封面')]`
+// dismissCoverGuide 尽力关掉「PK封面」新手引导气泡，失败不影响主流程。
+func dismissCoverGuide(page *rod.Page) {
+	if _, err := page.Timeout(3 * time.Second).Eval(coverGuideDismissJS); err != nil {
+		logrus.Debugf("关闭封面引导失败（忽略）: %v", err)
+		return
+	}
+	time.Sleep(800 * time.Millisecond)
+}
 
+// clickVideoCoverEntry 悬停封面缩略图，等「编辑封面」浮出后点击。
 func clickVideoCoverEntry(page *rod.Page) error {
-	el, err := page.Timeout(45 * time.Second).Element(`xpath=` + coverEntryXPath)
+	tile, err := page.Timeout(45 * time.Second).Element(coverTileSelector)
 	if err != nil {
-		return errors.New("未找到「设置封面」或「修改封面」入口")
+		return errors.Wrap(err, "未找到封面缩略图（.cover-plugin-preview .cover .default）")
 	}
-	if !isElementVisible(el) {
-		return errors.New("封面入口存在但不可见")
-	}
-	if err := el.ScrollIntoView(); err != nil {
-		logrus.Debugf("封面入口滚动失败: %v", err)
+	if err := tile.ScrollIntoView(); err != nil {
+		logrus.Debugf("封面缩略图滚动失败: %v", err)
 	}
 	time.Sleep(150 * time.Millisecond)
-	return humanize.Click(el)
+
+	// 入口只在悬停时出现；悬停 + 轮询，最多重试几次
+	var lastErr error
+	for i := 0; i < 5; i++ {
+		if err := humanize.Hover(tile); err != nil {
+			lastErr = err
+			time.Sleep(300 * time.Millisecond)
+			continue
+		}
+		time.Sleep(400 * time.Millisecond)
+
+		entry, err := tile.Timeout(3 * time.Second).Element(coverEntrySelector)
+		if err != nil {
+			lastErr = errors.Wrap(err, "悬停后未出现「编辑封面」")
+			continue
+		}
+		if err := humanize.Click(entry); err != nil {
+			lastErr = err
+			continue
+		}
+		return nil
+	}
+	return errors.Wrap(lastErr, "未找到「编辑封面」入口")
 }
 
 func uploadCoverInModal(page *rod.Page, coverPath string) error {
-	if _, err := page.Timeout(30 * time.Second).Element(`xpath=//*[contains(normalize-space(string(.)), '上传封面')]`); err != nil {
-		return errors.Wrap(err, "未出现封面编辑区（上传封面）")
+	if _, err := page.Timeout(30 * time.Second).Element(coverModalSelector); err != nil {
+		return errors.Wrap(err, "未出现封面编辑弹窗（.cover-modal）")
 	}
-	inputs, err := page.Elements("input[type='file']")
+	inp, err := page.Timeout(15 * time.Second).Element(coverInputSelector)
 	if err != nil {
-		return errors.Wrap(err, "查找封面上传控件失败")
+		return errors.Wrap(err, "未找到封面弹窗内的图片 file 输入框")
 	}
-	for _, inp := range inputs {
-		acceptPtr, _ := inp.Attribute("accept")
-		accept := ""
-		if acceptPtr != nil {
-			accept = *acceptPtr
-		}
-		if !acceptsImage(accept) {
-			continue
-		}
-		// 封面 file 多为隐藏控件，不以 Visible 过滤
-		if err := inp.SetFiles([]string{coverPath}); err != nil {
-			return errors.Wrap(err, "写入封面文件失败")
-		}
-		logrus.Info("已选择封面文件上传")
-		time.Sleep(800 * time.Millisecond)
-		return nil
+	// file 输入框是 label.upload-btn 里的隐藏控件，不以 Visible 过滤
+	if err := inp.SetFiles([]string{coverPath}); err != nil {
+		return errors.Wrap(err, "写入封面文件失败")
 	}
-	return errors.New("未找到接受图片的 file 输入框（上传封面）")
+	logrus.Info("已选择封面文件上传")
+
+	// 上传成功后弹窗底部会出现 .uploaded-thumbnail，并自动切换为该图为当前封面
+	if _, err := page.Timeout(30 * time.Second).Element(coverUploadedThumb); err != nil {
+		return errors.Wrap(err, "封面上传后未出现缩略图")
+	}
+	time.Sleep(800 * time.Millisecond)
+	return nil
 }
 
+// clickCoverConfirmButton 点击封面弹窗右下角「完成」。
 func clickCoverConfirmButton(page *rod.Page) error {
 	deadline := time.Now().Add(45 * time.Second)
 	for time.Now().Before(deadline) {
-		candidates, err := page.Elements("button")
+		btns, err := page.Elements(coverModalSelector + ` button`)
 		if err != nil {
 			time.Sleep(200 * time.Millisecond)
 			continue
 		}
-		for _, b := range candidates {
+		for _, b := range btns {
 			if !isElementVisible(b) {
 				continue
 			}
 			text, err := b.Text()
-			if err != nil {
+			if err != nil || strings.TrimSpace(text) != "完成" {
 				continue
 			}
-			if !strings.Contains(strings.TrimSpace(text), "确定") {
-				continue
-			}
-			parentText := ""
-			if p, err := b.Parent(); err == nil && p != nil {
-				pt, err := p.Text()
-				if err == nil {
-					parentText = pt
-				}
-			}
-			// 避免点到正文工具栏等其它「确定」，要求与封面弹层同语境
-			if strings.Contains(parentText, "上传封面") || strings.Contains(parentText, "封面") {
-				return humanize.Click(b)
-			}
+			return humanize.Click(b)
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	return errors.New("未找到封面编辑弹窗的「确定」按钮")
+	return errors.New("未找到封面编辑弹窗的「完成」按钮")
 }
 
+// waitCoverEditorSettled 等封面弹窗关闭。
 func waitCoverEditorSettled(page *rod.Page, maxWait time.Duration) error {
 	deadline := time.Now().Add(maxWait)
 	for time.Now().Before(deadline) {
-		// 上传弹层关闭后，页面上不应再出现「上传封面」文案
-		hasLabel, _, err := page.Has(`xpath=//*[contains(normalize-space(string(.)), '上传封面')]`)
-		if err == nil && !hasLabel {
+		has, modal, err := page.Has(coverModalSelector)
+		if err == nil && !has {
 			time.Sleep(500 * time.Millisecond)
 			return nil
 		}
-		// 备选：封面预览区出现图片（blob 或预览容器）
-		hasPreview, _, err2 := page.Has(`img[src*="blob:"]`)
-		if err2 == nil && hasPreview {
-			time.Sleep(500 * time.Millisecond)
-			return nil
+		if err == nil && modal != nil {
+			if vis, verr := modal.Visible(); verr == nil && !vis {
+				time.Sleep(500 * time.Millisecond)
+				return nil
+			}
 		}
 		time.Sleep(400 * time.Millisecond)
 	}
-	return errors.New("封面编辑未完成或预览未刷新")
+	return errors.New("封面编辑未完成：弹窗未关闭")
 }
